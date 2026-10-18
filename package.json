@@ -1,0 +1,13 @@
+{
+  "name": "tank-deathmatch-websocket-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal WebSocket relay for a Defold top-down tank deathmatch prototype",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

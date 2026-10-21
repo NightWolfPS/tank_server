@@ -142,11 +142,15 @@ function resetPlayerPosition(player) {
 function broadcastScoreboard() {
     const list = [...players.values()]
         .sort((a, b) =>
+            b.score - a.score ||
             b.kills - a.kills ||
             a.deaths - b.deaths
         )
         .map(player => ({
             id: player.id,
+            score: player.score,
+            damage_dealt: player.damageDealt,
+            ping: player.ping,
             kills: player.kills,
             deaths: player.deaths,
             life_state: player.lifeState
@@ -412,15 +416,31 @@ function registerHit(ws, message) {
     shooter.lastHitAt = now;
     shot.hitTargets.add(target.id);
 
-    const damage = Math.floor(message.damage);
-    target.hp = Math.max(0, target.hp - damage);
+    const requestedDamage = Math.floor(message.damage);
+    const actualDamage = Math.min(requestedDamage, target.hp);
+
+    if (actualDamage <= 0) {
+        send(ws, {
+            type: 'hit_rejected',
+            client_shot_id: clientShotId,
+            reason: 'target_has_no_hp'
+        });
+        return;
+    }
+
+    target.hp = Math.max(0, target.hp - actualDamage);
+
+    // Match statistics are authoritative on the server.
+    // +10 for every accepted hit; damage records only HP actually removed.
+    shooter.score += 10;
+    shooter.damageDealt += actualDamage;
 
     const hitEvent = {
         type: 'projectile_hit',
         player_id: shooter.id,
         target_player_id: target.id,
         shot_id: shot.id,
-        damage,
+        damage: actualDamage,
         hp: target.hp,
         x: message.x,
         y: message.y
@@ -437,6 +457,7 @@ function registerHit(ws, message) {
         // Credit the owner of the registered projectile even if that
         // owner is already dead or inactive.
         shooter.kills++;
+        shooter.score += 100;
 
         broadcast({
             type: 'kill_feed',
@@ -452,9 +473,11 @@ function registerHit(ws, message) {
             shot_id: shot.id
         });
 
-        broadcastScoreboard();
         log(`${shooter.id} killed ${target.id} with ${shot.id}`);
     }
+
+    // Refresh points and damage immediately after every accepted hit.
+    broadcastScoreboard();
 }
 
 function handleState(ws, message) {
@@ -604,6 +627,9 @@ function handleMessage(ws, message) {
                 type: 'scoreboard',
                 players: [...players.values()].map(player => ({
                     id: player.id,
+                    score: player.score,
+                    damage_dealt: player.damageDealt,
+                    ping: player.ping,
                     kills: player.kills,
                     deaths: player.deaths,
                     life_state: player.lifeState
@@ -667,6 +693,10 @@ wss.on('connection', (ws) => {
         spawn_index: spawnIndex,
         lifeState: 'alive',
         hp: 100,
+        score: 0,
+        damageDealt: 0,
+        ping: 0,
+        pingSentAt: 0,
         kills: 0,
         deaths: 0,
         ready: false,
@@ -679,6 +709,15 @@ wss.on('connection', (ws) => {
 
     ws.playerId = id;
     players.set(id, player);
+
+    // Measure server-observed WebSocket round-trip latency using control frames.
+    ws.on('pong', () => {
+        if (player.pingSentAt > 0) {
+            player.ping = Math.max(0, Date.now() - player.pingSentAt);
+            player.pingSentAt = 0;
+            broadcastScoreboard();
+        }
+    });
 
     sendWelcome(ws, player);
 
@@ -721,6 +760,22 @@ wss.on('connection', (ws) => {
 
 const cleanupTimer = setInterval(pruneShots, 1000);
 
+const pingTimer = setInterval(() => {
+    const now = Date.now();
+
+    for (const player of players.values()) {
+        if (!isOpen(player.ws)) continue;
+
+        player.pingSentAt = now;
+
+        try {
+            player.ws.ping();
+        } catch (error) {
+            log(`Ping failed for ${player.id}:`, error.message);
+        }
+    }
+}, 2000);
+
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
     log(`Max players: ${MAX_PLAYERS}`);
@@ -729,6 +784,7 @@ wss.on('listening', () => {
 function shutdown() {
     log('Shutting down...');
     clearInterval(cleanupTimer);
+    clearInterval(pingTimer);
 
     for (const ws of wss.clients) {
         try {

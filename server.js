@@ -580,6 +580,22 @@ function handleMessage(ws, message) {
     }
 
     switch (message.type) {
+        case 'pong': {
+            const player = getPlayer(ws);
+            if (!player || !Number.isSafeInteger(message.ping_id)) return;
+
+            const sentAt = player.pingPending.get(message.ping_id);
+            if (sentAt === undefined) {
+                // Ignore unknown, duplicated, or already superseded responses.
+                return;
+            }
+
+            player.pingPending.delete(message.ping_id);
+            player.ping = Math.max(0, Date.now() - sentAt);
+            broadcastScoreboard();
+            break;
+        }
+
         case 'client_ready': {
             const player = getPlayer(ws);
             if (!player) return;
@@ -696,7 +712,8 @@ wss.on('connection', (ws) => {
         score: 0,
         damageDealt: 0,
         ping: 0,
-        pingSentAt: 0,
+        pingPending: new Map(),
+        nextPingId: 1,
         kills: 0,
         deaths: 0,
         ready: false,
@@ -709,15 +726,6 @@ wss.on('connection', (ws) => {
 
     ws.playerId = id;
     players.set(id, player);
-
-    // Measure server-observed WebSocket round-trip latency using control frames.
-    ws.on('pong', () => {
-        if (player.pingSentAt > 0) {
-            player.ping = Math.max(0, Date.now() - player.pingSentAt);
-            player.pingSentAt = 0;
-            broadcastScoreboard();
-        }
-    });
 
     sendWelcome(ws, player);
 
@@ -760,21 +768,35 @@ wss.on('connection', (ws) => {
 
 const cleanupTimer = setInterval(pruneShots, 1000);
 
-const pingTimer = setInterval(() => {
-    const now = Date.now();
+let nextPingId = 1;
 
+const pingTimer = setInterval(() => {
     for (const player of players.values()) {
         if (!isOpen(player.ws)) continue;
 
-        player.pingSentAt = now;
+        const pingId = nextPingId++;
+        const sentAt = Date.now();
 
-        try {
-            player.ws.ping();
-        } catch (error) {
-            log(`Ping failed for ${player.id}:`, error.message);
+        // Keep outstanding requests correlated by ID. This matters when a
+        // response is delayed and newer pings have already been sent.
+        player.pingPending.set(pingId, sentAt);
+
+        // Bound memory if a client stays connected but never responds.
+        while (player.pingPending.size > 120) {
+            const oldestPingId = player.pingPending.keys().next().value;
+            player.pingPending.delete(oldestPingId);
+        }
+
+        const sent = send(player.ws, {
+            type: 'ping',
+            ping_id: pingId
+        });
+
+        if (!sent) {
+            player.pingPending.delete(pingId);
         }
     }
-}, 2000);
+}, 1000);
 
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);

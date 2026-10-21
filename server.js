@@ -16,23 +16,22 @@ const MAX_PLAYERS = Math.max(
 );
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
-
-// Network limits
 const MIN_STATE_INTERVAL_MS = 50;
 const MIN_SHOT_INTERVAL_MS = 250;
 const MIN_HIT_INTERVAL_MS = 20;
-const MIN_DEATH_INTERVAL_MS = 500;
 const HEARTBEAT_INTERVAL_MS = 30000;
 
-// Temporary prototype limits. Tune to actual game units and weapon settings.
+// Movement checks are provisional and must be tuned to the actual game units.
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 const MAX_REPORTED_DAMAGE = 100;
 const MAX_SPEED_UNITS_PER_SECOND = 1200;
 const MOVEMENT_ALLOWANCE = 100;
 
-// Must be compatible with the existing client's respawn delay.
-const RESPAWN_COOLDOWN_MS = 1200;
+// Keep registered shots long enough for a projectile to finish its flight.
+// Projectile lifetime in the current Defold setup is 1.5 seconds.
+const SHOT_TTL_MS = 10000;
+const MAX_SHOTS_PER_PLAYER = 128;
 
 const wss = new WebSocketServer({
     host: HOST,
@@ -41,7 +40,10 @@ const wss = new WebSocketServer({
 });
 
 const players = new Map();
+const shots = new Map();
+
 let nextPlayerNumber = 1;
+let nextShotNumber = 1;
 let shuttingDown = false;
 
 function send(ws, message) {
@@ -77,11 +79,15 @@ function broadcast(message, exceptSocket = null) {
     }
 }
 
-function finiteNumber(value, min = -MAX_COORDINATE, max = MAX_COORDINATE) {
-    return typeof value === 'number'
-        && Number.isFinite(value)
-        && value >= min
-        && value <= max;
+function finiteNumber(
+    value,
+    min = -MAX_COORDINATE,
+    max = MAX_COORDINATE
+) {
+    return typeof value === 'number' &&
+        Number.isFinite(value) &&
+        value >= min &&
+        value <= max;
 }
 
 function validAngle(value) {
@@ -101,10 +107,10 @@ function getFreeSpawnIndex() {
 }
 
 function isActive(player) {
-    return Boolean(player)
-        && player.lifeState === 'alive'
-        && player.x !== null
-        && player.y !== null;
+    return Boolean(player) &&
+        player.lifeState === 'alive' &&
+        player.x !== null &&
+        player.y !== null;
 }
 
 function publicPlayer(player) {
@@ -137,10 +143,10 @@ function getScoreboard() {
                 return a.deaths - b.deaths;
             }
 
-            const aNumber = Number(a.id.replace('player_', '')) || 0;
-            const bNumber = Number(b.id.replace('player_', '')) || 0;
+            const an = Number(a.id.replace('player_', '')) || 0;
+            const bn = Number(b.id.replace('player_', '')) || 0;
 
-            return aNumber - bNumber;
+            return an - bn;
         });
 }
 
@@ -157,6 +163,8 @@ function removePlayer(ws) {
 
     if (!id || !players.has(id)) return;
 
+    // Keep registered shots after disconnect. However, the current protocol
+    // still needs a persistent owner record to process hits after disconnection.
     players.delete(id);
     ws.playerId = null;
 
@@ -210,8 +218,77 @@ function parseMessage(raw, ws) {
     return message;
 }
 
+function pruneShots(now = Date.now()) {
+    for (const [shotId, shot] of shots) {
+        if (now - shot.createdAt > SHOT_TTL_MS) {
+            shots.delete(shotId);
+        }
+    }
+}
+
+function countShotsForOwner(ownerId) {
+    let count = 0;
+
+    for (const shot of shots.values()) {
+        if (shot.ownerId === ownerId) count++;
+    }
+
+    return count;
+}
+
+function registerShot(player, message, now) {
+    pruneShots(now);
+
+    if (countShotsForOwner(player.id) >= MAX_SHOTS_PER_PLAYER) {
+        return null;
+    }
+
+    const suppliedId = typeof message.shot_id === 'string'
+        ? message.shot_id.slice(0, 64)
+        : '';
+
+    // The server-generated ID is authoritative.
+    const shotId = `shot_${nextShotNumber++}`;
+
+    const shot = {
+        id: shotId,
+        clientShotId: suppliedId,
+        ownerId: player.id,
+        createdAt: now,
+        x: message.x,
+        y: message.y,
+        z: finiteNumber(message.z, -10000, 10000)
+            ? message.z
+            : 0.5,
+        angle: message.angle,
+        hitTargets: new Set(),
+    };
+
+    shots.set(shotId, shot);
+
+    return shot;
+}
+
+function getShotForHit(message, ownerId, now) {
+    pruneShots(now);
+
+    if (
+        typeof message.shot_id !== 'string' ||
+        message.shot_id.length > 80
+    ) {
+        return null;
+    }
+
+    const shot = shots.get(message.shot_id);
+
+    if (!shot || shot.ownerId !== ownerId) return null;
+    if (now - shot.createdAt > SHOT_TTL_MS) return null;
+
+    return shot;
+}
+
 function setInactive(player, reason = 'inactive') {
-    if (!player || player.lifeState === 'inactive') return false;
+    if (!player || player.lifeState !== 'alive') return false;
 
     player.lifeState = 'inactive';
     player.x = null;
@@ -226,6 +303,92 @@ function setInactive(player, reason = 'inactive') {
     });
 
     console.log(`[INACTIVE] ${player.id} (${reason})`);
+
+    broadcastScoreboard();
+
+    return true;
+}
+
+function applyReportedHit(shooter, target, shot, message, now) {
+    // A registered projectile remains valid after its owner dies.
+    // The same shot cannot hit the same target more than once.
+    if (shot.hitTargets.has(target.id)) return false;
+
+    shot.hitTargets.add(target.id);
+
+    const damage = message.damage;
+
+    target.lastDamage = {
+        attackerId: shooter.id,
+        shotId: shot.id,
+        damage,
+        at: now,
+    };
+
+    broadcast({
+        type: 'projectile_hit',
+        player_id: shooter.id,
+        target_player_id: target.id,
+        damage,
+        x: message.x,
+        y: message.y,
+        shot_id: shot.id,
+        server_time: now,
+    });
+
+    console.log(
+        `[HIT REPORT] ${shooter.id} -> ${target.id}: ${damage}; ${shot.id}`
+    );
+
+    return true;
+}
+
+function registerDeath(victim, killerId, now) {
+    if (!victim || victim.lifeState !== 'alive') return false;
+
+    victim.lifeState = 'dead';
+    victim.x = null;
+    victim.y = null;
+    victim.body_angle = 0;
+    victim.turret_angle = 0;
+    victim.deaths += 1;
+
+    const killer = killerId ? players.get(killerId) : null;
+
+    // The shooter may already be dead or inactive.
+    // Credit is based on the registered projectile, not the shooter's
+    // current life state.
+    const creditedKillerId =
+        killer && killer.id !== victim.id
+            ? killer.id
+            : null;
+
+    if (creditedKillerId) {
+        killer.kills += 1;
+    }
+
+    broadcast({
+        type: 'player_inactive',
+        player_id: victim.id,
+    });
+
+    broadcast({
+        type: 'kill_feed',
+        killer_id: creditedKillerId,
+        victim_id: victim.id,
+        server_time: now,
+    });
+
+    if (creditedKillerId) {
+        console.log(
+            `[KILL] ${creditedKillerId} -> ${victim.id}; K/D updated`
+        );
+    } else {
+        console.log(
+            `[DEATH] ${victim.id} (no credited player killer)`
+        );
+    }
+
     broadcastScoreboard();
 
     return true;
@@ -285,6 +448,7 @@ wss.on('connection', (ws, request) => {
         // alive | dead | inactive
         lifeState: 'alive',
 
+        lastDamage: null,
         rateLimits: Object.create(null),
     };
 
@@ -328,9 +492,6 @@ wss.on('connection', (ws, request) => {
         const now = Date.now();
 
         switch (message.type) {
-            // -----------------------------------------------
-            // Player movement and rotation
-            // -----------------------------------------------
             case 'state': {
                 if (!rateLimitPassed(
                     current,
@@ -350,42 +511,29 @@ wss.on('connection', (ws, request) => {
                     return;
                 }
 
-                // Dead players cannot become alive merely by sending state.
-                // The current client protocol has no explicit respawn message,
-                // so inactive players may resume after the cooldown below.
-                if (current.lifeState === 'dead') return;
-
-                if (current.lifeState === 'inactive') {
-                    const inactiveFor = now - current.lastInactiveAt;
-
-                    if (inactiveFor < RESPAWN_COOLDOWN_MS) return;
-
-                    // Compatibility bridge for the existing tank_spawner.
-                    // A future protocol should replace this with an explicit,
-                    // server-authorized respawn event.
-                    current.lifeState = 'alive';
-                    console.log(`[RESPAWN PROVISIONAL] ${current.id}`);
-                }
+                // A state packet cannot resurrect a dead or inactive player.
+                if (current.lifeState !== 'alive') return;
 
                 if (
                     current.x !== null &&
                     current.y !== null &&
                     current.lastStateAt > 0
                 ) {
-                    const elapsedSeconds = Math.max(
+                    const elapsed = Math.max(
                         0,
                         (now - current.lastStateAt) / 1000
                     );
 
-                    const dx = message.x - current.x;
-                    const dy = message.y - current.y;
-                    const distance = Math.hypot(dx, dy);
+                    const distance = Math.hypot(
+                        message.x - current.x,
+                        message.y - current.y
+                    );
 
-                    const allowedDistance =
-                        MAX_SPEED_UNITS_PER_SECOND * elapsedSeconds
-                        + MOVEMENT_ALLOWANCE;
+                    const allowed =
+                        MAX_SPEED_UNITS_PER_SECOND * elapsed +
+                        MOVEMENT_ALLOWANCE;
 
-                    if (distance > allowedDistance) {
+                    if (distance > allowed) {
                         send(ws, {
                             type: 'state_rejected',
                             reason: 'movement_limit',
@@ -416,9 +564,6 @@ wss.on('connection', (ws, request) => {
                 break;
             }
 
-            // -----------------------------------------------
-            // Shot visual event
-            // -----------------------------------------------
             case 'shot': {
                 if (!isActive(current)) return;
 
@@ -439,34 +584,35 @@ wss.on('connection', (ws, request) => {
                     return;
                 }
 
-                const z = finiteNumber(message.z, -10000, 10000)
-                    ? message.z
-                    : 0.5;
+                const shot = registerShot(current, message, now);
 
-                const shotId = typeof message.shot_id === 'string'
-                    ? message.shot_id.slice(0, 64)
-                    : '';
+                if (!shot) return;
 
                 broadcast({
                     type: 'shot',
                     player_id: current.id,
-                    x: message.x,
-                    y: message.y,
-                    z,
-                    angle: message.angle,
-                    shot_id: shotId,
+                    x: shot.x,
+                    y: shot.y,
+                    z: shot.z,
+                    angle: shot.angle,
+                    shot_id: shot.id,
                     server_time: now,
                 }, ws);
+
+                // The client must associate this server ID with its projectile.
+                send(ws, {
+                    type: 'shot_registered',
+                    client_shot_id: shot.clientShotId,
+                    shot_id: shot.id,
+                    server_time: now,
+                });
 
                 break;
             }
 
-            // -----------------------------------------------
-            // Client-reported hit
-            // -----------------------------------------------
             case 'projectile_hit': {
-                if (!isActive(current)) return;
-
+                // Intentionally do not require the shooter to be alive here.
+                // A projectile fired before death may still hit afterward.
                 if (!rateLimitPassed(
                     current,
                     'hit',
@@ -479,10 +625,29 @@ wss.on('connection', (ws, request) => {
                 if (
                     typeof message.target_player_id !== 'string' ||
                     message.target_player_id.length > 64 ||
-                    !finiteNumber(message.damage, 0, MAX_REPORTED_DAMAGE) ||
+                    !finiteNumber(
+                        message.damage,
+                        0,
+                        MAX_REPORTED_DAMAGE
+                    ) ||
                     !finiteNumber(message.x) ||
                     !finiteNumber(message.y)
                 ) {
+                    return;
+                }
+
+                const shot = getShotForHit(
+                    message,
+                    current.id,
+                    now
+                );
+
+                if (!shot) {
+                    send(ws, {
+                        type: 'hit_rejected',
+                        reason: 'invalid_or_expired_shot',
+                    });
+
                     return;
                 }
 
@@ -495,119 +660,46 @@ wss.on('connection', (ws, request) => {
                     return;
                 }
 
-                // IMPORTANT:
-                // The server still cannot verify hit geometry. This event
-                // is only validated and relayed, not authoritatively simulated.
-                broadcast({
-                    type: 'projectile_hit',
-                    player_id: current.id,
-                    target_player_id: target.id,
-                    damage: message.damage,
-                    x: message.x,
-                    y: message.y,
-                    server_time: now,
-                });
-
-                console.log(
-                    `[HIT REPORT] ${current.id} -> ${target.id}: ${message.damage}`
+                const applied = applyReportedHit(
+                    current,
+                    target,
+                    shot,
+                    message,
+                    now
                 );
 
+                if (!applied) return;
+
+                // HP and lethal-hit validation are still client-authoritative.
+                // The server cannot independently determine whether this
+                // reported hit actually killed the target.
                 break;
             }
 
-            // -----------------------------------------------
-            // Player became inactive / tank removed
-            // -----------------------------------------------
             case 'player_inactive': {
-                if (!rateLimitPassed(
-                    current,
-                    'inactive',
-                    MIN_DEATH_INTERVAL_MS,
-                    now
-                )) {
-                    return;
-                }
-
+                // This does not restore life or clear a confirmed death.
                 setInactive(current, 'client request');
                 break;
             }
 
-            // -----------------------------------------------
-            // Player death
-            // -----------------------------------------------
             case 'player_killed': {
                 if (current.lifeState !== 'alive') return;
 
-                if (!rateLimitPassed(
-                    current,
-                    'death',
-                    MIN_DEATH_INTERVAL_MS,
-                    now
-                )) {
-                    return;
-                }
+                // Legacy fallback: use the last reported damaging hit.
+                // This is not fully authoritative until server-side HP is added.
+                const lastDamage = current.lastDamage;
 
-                current.lifeState = 'dead';
-                current.x = null;
-                current.y = null;
-                current.body_angle = 0;
-                current.turret_angle = 0;
+                const killerId =
+                    lastDamage &&
+                    now - lastDamage.at <= SHOT_TTL_MS
+                        ? lastDamage.attackerId
+                        : null;
 
-                let killerId =
-                    typeof message.killer_id === 'string' &&
-                    message.killer_id.length <= 64
-                        ? message.killer_id
-                        : '';
-
-                if (killerId === current.id) {
-                    killerId = '';
-                }
-
-                const killer = killerId
-                    ? players.get(killerId)
-                    : null;
-
-                const creditedKillerId = isActive(killer)
-                    ? killer.id
-                    : null;
-
-                current.deaths += 1;
-
-                if (creditedKillerId) {
-                    killer.kills += 1;
-                }
-
-                // Keep the existing client's protocol compatible.
-                broadcast({
-                    type: 'player_inactive',
-                    player_id: current.id,
-                });
-
-                broadcast({
-                    type: 'kill_feed',
-                    killer_id: creditedKillerId,
-                    victim_id: current.id,
-                    server_time: now,
-                });
-
-                if (creditedKillerId) {
-                    console.log(
-                        `[KILL] ${creditedKillerId} -> ${current.id}; K/D updated`
-                    );
-                } else {
-                    console.log(
-                        `[DEATH] ${current.id} (no credited player killer)`
-                    );
-                }
-
-                broadcastScoreboard();
+                registerDeath(current, killerId, now);
 
                 break;
             }
 
-            // -----------------------------------------------
-            // Client handshake
-            // -----------------------------------------------
             case 'client_ready': {
                 send(ws, {
                     type: 'ready',
@@ -623,9 +715,6 @@ wss.on('connection', (ws, request) => {
                 break;
             }
 
-            // -----------------------------------------------
-            // Scoreboard request
-            // -----------------------------------------------
             case 'request_scoreboard': {
                 send(ws, {
                     type: 'scoreboard',
@@ -637,7 +726,6 @@ wss.on('connection', (ws, request) => {
             }
 
             default:
-                // Unknown messages are ignored.
                 break;
         }
     });
@@ -651,9 +739,7 @@ wss.on('connection', (ws, request) => {
     });
 });
 
-// -----------------------------------------------
 // WebSocket heartbeat
-// -----------------------------------------------
 const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
         if (ws.isAlive === false) {
@@ -671,9 +757,7 @@ const heartbeat = setInterval(() => {
     }
 }, HEARTBEAT_INTERVAL_MS);
 
-// -----------------------------------------------
 // Graceful shutdown
-// -----------------------------------------------
 function shutdown(signal) {
     if (shuttingDown) return;
 
@@ -714,10 +798,14 @@ wss.on('close', () => clearInterval(heartbeat));
 
 wss.on('listening', () => {
     console.log('-----------------------------------------');
-    console.log(`Tank multiplayer test server listening on ws://${HOST}:${PORT}`);
-    console.log(`Max players: ${MAX_PLAYERS}; spawn markers: ${SPAWN_POINTS}`);
     console.log(
-        'Prototype relay: clients report movement and hits; hit geometry is not server-verified.'
+        `Tank multiplayer test server listening on ws://${HOST}:${PORT}`
+    );
+    console.log(
+        `Max players: ${MAX_PLAYERS}; spawn markers: ${SPAWN_POINTS}`
+    );
+    console.log(
+        'Registered shots survive shooter death; hit geometry is not server-verified yet.'
     );
     console.log('Press Ctrl+C to stop.');
     console.log('-----------------------------------------');

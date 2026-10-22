@@ -18,6 +18,29 @@ const SHOT_TTL_MS = 10000;
 const MAX_SHOTS_PER_PLAYER = 128;
 const RESPAWN_DELAY_MS = 500;
 const MAX_DAMAGE = 100;
+
+// Central PvP combat tuning.
+const BALANCE = {
+    BASE_DAMAGE: 25,
+    MIN_DAMAGE: 5,
+    PROJECTILE_LIFETIME_SEC: 2.0,
+    CRITICAL_CHANCE: 0.15,
+    CRITICAL_MAX_BONUS_MULTIPLIER: 1.5,
+    CRITICAL_MAX_ANGLE_DEG: 15,
+    SLOW_CHANCE_POINT_BLANK: 0.12,
+    SLOW_DURATION_SEC: 7,
+    STUN_CHANCE_POINT_BLANK: 0.10,
+    STUN_DURATION_SEC: 5,
+    GUN_DAMAGE_CHANCE: 0.05,
+    GUN_DAMAGE_RELOADS: 3,
+    GUN_DAMAGE_RELOAD_PENALTY: 0.50,
+    BURN_MAX_CHANCE: 0.15,
+    BURN_MIN_CHANCE: 0.01,
+    BURN_DURATION_SEC: 3,
+    BURN_TICK_INTERVAL_SEC: 0.75,
+    BURN_TICK_DAMAGE_MIN: 5,
+    BURN_TICK_DAMAGE_MAX: 7
+};
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
@@ -142,15 +165,11 @@ function resetPlayerPosition(player) {
 function broadcastScoreboard() {
     const list = [...players.values()]
         .sort((a, b) =>
-            b.score - a.score ||
             b.kills - a.kills ||
             a.deaths - b.deaths
         )
         .map(player => ({
             id: player.id,
-            score: player.score,
-            damage_dealt: player.damageDealt,
-            ping: player.ping,
             kills: player.kills,
             deaths: player.deaths,
             life_state: player.lifeState
@@ -324,6 +343,90 @@ function registerShot(ws, message) {
     }, ws);
 }
 
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function randomChance(chance) {
+    return Math.random() < clamp(chance, 0, 1);
+}
+
+// Orientation estimate: 0 degrees is a frontal hit, 90 degrees is grazing.
+function getImpactAngleDeg(shot, target) {
+    const raw = Math.abs(shot.angle - target.body_angle);
+    const wrapped = Math.abs(Math.atan2(Math.sin(raw), Math.cos(raw)));
+    return Math.abs(180 - wrapped * 180 / Math.PI);
+}
+
+function calculateBaseDamage(shot, now) {
+    const elapsed = Math.max(0, (now - shot.createdAt) / 1000);
+    const progress = clamp(elapsed / BALANCE.PROJECTILE_LIFETIME_SEC, 0, 1);
+    return Math.max(0, Math.round(
+        BALANCE.BASE_DAMAGE +
+        (BALANCE.MIN_DAMAGE - BALANCE.BASE_DAMAGE) * progress
+    ));
+}
+
+function broadcastKill(killerId, target, shotId, now) {
+    if (!target || target.lifeState !== 'alive') return false;
+    target.lifeState = 'dead';
+    target.deathAt = now;
+    target.deaths++;
+
+    const killer = typeof killerId === 'string' ? players.get(killerId) : null;
+    if (killer && killer.id !== target.id) killer.kills++;
+
+    broadcast({
+        type: 'kill_feed',
+        killer_id: killer ? killer.id : 'WORLD',
+        victim_id: target.id,
+        shot_id: shotId || ''
+    });
+    broadcast({
+        type: 'player_killed',
+        killer_id: killer ? killer.id : 'WORLD',
+        victim_id: target.id,
+        shot_id: shotId || ''
+    });
+    broadcastScoreboard();
+    log(`${killer ? killer.id : 'WORLD'} killed ${target.id}${shotId ? ` with ${shotId}` : ' with burn'}`);
+    return true;
+}
+
+function applyBurnTick(target, now) {
+    const burn = target.burn;
+    if (!burn || target.lifeState !== 'alive') {
+        target.burn = null;
+        return;
+    }
+    if (now >= burn.endsAt) {
+        target.burn = null;
+        broadcast({ type: 'status_effect_expired', target_player_id: target.id, effect: 'burn' });
+        return;
+    }
+    if (now < burn.nextTickAt) return;
+
+    burn.nextTickAt = now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000;
+    const damage = BALANCE.BURN_TICK_DAMAGE_MIN + Math.floor(
+        Math.random() * (BALANCE.BURN_TICK_DAMAGE_MAX - BALANCE.BURN_TICK_DAMAGE_MIN + 1)
+    );
+    target.hp = Math.max(0, target.hp - damage);
+
+    broadcast({
+        type: 'status_damage',
+        target_player_id: target.id,
+        killer_id: burn.ownerId || '',
+        damage,
+        hp: target.hp,
+        effect: 'burn'
+    });
+
+    if (target.hp <= 0 && target.lifeState === 'alive') {
+        broadcastKill(burn.ownerId, target, burn.shotId, now);
+        target.burn = null;
+    }
+}
+
 function registerHit(ws, message) {
     const shooter = getPlayer(ws);
 
@@ -366,6 +469,15 @@ function registerHit(ws, message) {
         return;
     }
 
+    if (Date.now() - shot.createdAt > BALANCE.PROJECTILE_LIFETIME_SEC * 1000 + 250) {
+        send(ws, {
+            type: 'hit_rejected',
+            client_shot_id: clientShotId,
+            reason: 'projectile_lifetime_exceeded'
+        });
+        return;
+    }
+
     const targetId = message.target_player_id;
     const target = typeof targetId === 'string'
         ? players.get(targetId)
@@ -400,84 +512,79 @@ function registerHit(ws, message) {
         return;
     }
 
-    if (!isNumber(message.damage) ||
-        message.damage <= 0 ||
-        message.damage > MAX_DAMAGE ||
-        !validCoordinate(message.x) ||
-        !validCoordinate(message.y)) {
-        send(ws, {
-            type: 'hit_rejected',
-            client_shot_id: clientShotId,
-            reason: 'invalid_hit_data'
-        });
+    if (!validCoordinate(message.x) || !validCoordinate(message.y)) {
+        send(ws, { type: 'hit_rejected', client_shot_id: clientShotId, reason: 'invalid_hit_data' });
         return;
     }
 
     shooter.lastHitAt = now;
     shot.hitTargets.add(target.id);
 
-    const requestedDamage = Math.floor(message.damage);
-    const actualDamage = Math.min(requestedDamage, target.hp);
+    // Never trust client-supplied damage or effect flags.
+    let damage = calculateBaseDamage(shot, now);
+    const impactAngleDeg = getImpactAngleDeg(shot, target);
+    const flightProgress = clamp(
+        ((now - shot.createdAt) / 1000) / BALANCE.PROJECTILE_LIFETIME_SEC, 0, 1
+    );
+    const distanceFactor = 1 - flightProgress;
+    const effects = {
+        critical: false,
+        slow_duration: 0,
+        stun_duration: 0,
+        gun_damage_reloads: 0,
+        burn_duration: 0
+    };
 
-    if (actualDamage <= 0) {
-        send(ws, {
-            type: 'hit_rejected',
-            client_shot_id: clientShotId,
-            reason: 'target_has_no_hp'
-        });
-        return;
+    if (impactAngleDeg <= BALANCE.CRITICAL_MAX_ANGLE_DEG &&
+        randomChance(BALANCE.CRITICAL_CHANCE)) {
+        damage = Math.round(damage * (
+            1 + BALANCE.CRITICAL_MAX_BONUS_MULTIPLIER * distanceFactor
+        ));
+        effects.critical = true;
+    }
+    if (randomChance(BALANCE.SLOW_CHANCE_POINT_BLANK * distanceFactor)) {
+        effects.slow_duration = BALANCE.SLOW_DURATION_SEC;
+    }
+    if (randomChance(BALANCE.STUN_CHANCE_POINT_BLANK * distanceFactor)) {
+        effects.stun_duration = BALANCE.STUN_DURATION_SEC;
+    }
+    if (randomChance(BALANCE.GUN_DAMAGE_CHANCE)) {
+        effects.gun_damage_reloads = BALANCE.GUN_DAMAGE_RELOADS;
     }
 
-    target.hp = Math.max(0, target.hp - actualDamage);
+    const angle = clamp(impactAngleDeg, 0, 90);
+    const burnChance = BALANCE.BURN_MIN_CHANCE +
+        (BALANCE.BURN_MAX_CHANCE - BALANCE.BURN_MIN_CHANCE) *
+        Math.sin(angle * Math.PI / 90);
+    if (randomChance(burnChance)) {
+        effects.burn_duration = BALANCE.BURN_DURATION_SEC;
+        target.burn = {
+            ownerId: shooter.id,
+            shotId: shot.id,
+            endsAt: now + BALANCE.BURN_DURATION_SEC * 1000,
+            nextTickAt: now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000
+        };
+    }
 
-    // Match statistics are authoritative on the server.
-    // +10 for every accepted hit; damage records only HP actually removed.
-    shooter.score += 10;
-    shooter.damageDealt += actualDamage;
+    damage = clamp(Math.floor(damage), 1, MAX_DAMAGE);
+    target.hp = Math.max(0, target.hp - damage);
 
-    const hitEvent = {
+    broadcast({
         type: 'projectile_hit',
         player_id: shooter.id,
         target_player_id: target.id,
         shot_id: shot.id,
-        damage: actualDamage,
+        damage,
         hp: target.hp,
         x: message.x,
-        y: message.y
-    };
-
-    // The victim's client applies this damage to its local tank.
-    broadcast(hitEvent);
+        y: message.y,
+        effects,
+        impact_angle_deg: Math.round(impactAngleDeg)
+    });
 
     if (target.hp <= 0 && target.lifeState === 'alive') {
-        target.lifeState = 'dead';
-        target.deathAt = now;
-        target.deaths++;
-
-        // Credit the owner of the registered projectile even if that
-        // owner is already dead or inactive.
-        shooter.kills++;
-        shooter.score += 100;
-
-        broadcast({
-            type: 'kill_feed',
-            killer_id: shooter.id,
-            victim_id: target.id,
-            shot_id: shot.id
-        });
-
-        broadcast({
-            type: 'player_killed',
-            killer_id: shooter.id,
-            victim_id: target.id,
-            shot_id: shot.id
-        });
-
-        log(`${shooter.id} killed ${target.id} with ${shot.id}`);
+        broadcastKill(shooter.id, target, shot.id, now);
     }
-
-    // Refresh points and damage immediately after every accepted hit.
-    broadcastScoreboard();
 }
 
 function handleState(ws, message) {
@@ -555,6 +662,7 @@ function requestRespawn(ws) {
 
     player.lifeState = 'alive';
     player.hp = 100;
+    player.burn = null;
     player.lastShotAt = 0;
     player.lastHitAt = 0;
     player.lastStateAt = 0;
@@ -580,22 +688,6 @@ function handleMessage(ws, message) {
     }
 
     switch (message.type) {
-        case 'pong': {
-            const player = getPlayer(ws);
-            if (!player || !Number.isSafeInteger(message.ping_id)) return;
-
-            const sentAt = player.pingPending.get(message.ping_id);
-            if (sentAt === undefined) {
-                // Ignore unknown, duplicated, or already superseded responses.
-                return;
-            }
-
-            player.pingPending.delete(message.ping_id);
-            player.ping = Math.max(0, Date.now() - sentAt);
-            broadcastScoreboard();
-            break;
-        }
-
         case 'client_ready': {
             const player = getPlayer(ws);
             if (!player) return;
@@ -643,9 +735,6 @@ function handleMessage(ws, message) {
                 type: 'scoreboard',
                 players: [...players.values()].map(player => ({
                     id: player.id,
-                    score: player.score,
-                    damage_dealt: player.damageDealt,
-                    ping: player.ping,
                     kills: player.kills,
                     deaths: player.deaths,
                     life_state: player.lifeState
@@ -709,11 +798,7 @@ wss.on('connection', (ws) => {
         spawn_index: spawnIndex,
         lifeState: 'alive',
         hp: 100,
-        score: 0,
-        damageDealt: 0,
-        ping: 0,
-        pingPending: new Map(),
-        nextPingId: 1,
+        burn: null,
         kills: 0,
         deaths: 0,
         ready: false,
@@ -766,37 +851,11 @@ wss.on('connection', (ws) => {
     });
 });
 
-const cleanupTimer = setInterval(pruneShots, 1000);
-
-let nextPingId = 1;
-
-const pingTimer = setInterval(() => {
-    for (const player of players.values()) {
-        if (!isOpen(player.ws)) continue;
-
-        const pingId = nextPingId++;
-        const sentAt = Date.now();
-
-        // Keep outstanding requests correlated by ID. This matters when a
-        // response is delayed and newer pings have already been sent.
-        player.pingPending.set(pingId, sentAt);
-
-        // Bound memory if a client stays connected but never responds.
-        while (player.pingPending.size > 120) {
-            const oldestPingId = player.pingPending.keys().next().value;
-            player.pingPending.delete(oldestPingId);
-        }
-
-        const sent = send(player.ws, {
-            type: 'ping',
-            ping_id: pingId
-        });
-
-        if (!sent) {
-            player.pingPending.delete(pingId);
-        }
-    }
-}, 1000);
+const cleanupTimer = setInterval(() => {
+    pruneShots();
+    const now = Date.now();
+    for (const player of players.values()) applyBurnTick(player, now);
+}, 100);
 
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
@@ -806,7 +865,6 @@ wss.on('listening', () => {
 function shutdown() {
     log('Shutting down...');
     clearInterval(cleanupTimer);
-    clearInterval(pingTimer);
 
     for (const ws of wss.clients) {
         try {

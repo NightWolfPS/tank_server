@@ -131,6 +131,9 @@ function publicPlayer(player) {
         spawn_index: player.spawn_index,
         life_state: player.lifeState,
         hp: player.hp,
+        score: player.score,
+        damage_dealt: player.damageDealt,
+        ping: player.ping,
         kills: player.kills,
         deaths: player.deaths
     };
@@ -165,11 +168,15 @@ function resetPlayerPosition(player) {
 function broadcastScoreboard() {
     const list = [...players.values()]
         .sort((a, b) =>
+            b.score - a.score ||
             b.kills - a.kills ||
             a.deaths - b.deaths
         )
         .map(player => ({
             id: player.id,
+            score: player.score,
+            damage_dealt: player.damageDealt,
+            ping: player.ping,
             kills: player.kills,
             deaths: player.deaths,
             life_state: player.lifeState
@@ -374,7 +381,10 @@ function broadcastKill(killerId, target, shotId, now) {
     target.deaths++;
 
     const killer = typeof killerId === 'string' ? players.get(killerId) : null;
-    if (killer && killer.id !== target.id) killer.kills++;
+    if (killer && killer.id !== target.id) {
+        killer.kills++;
+        killer.score += 100;
+    }
 
     broadcast({
         type: 'kill_feed',
@@ -410,13 +420,16 @@ function applyBurnTick(target, now) {
     const damage = BALANCE.BURN_TICK_DAMAGE_MIN + Math.floor(
         Math.random() * (BALANCE.BURN_TICK_DAMAGE_MAX - BALANCE.BURN_TICK_DAMAGE_MIN + 1)
     );
-    target.hp = Math.max(0, target.hp - damage);
+    const actualDamage = Math.min(damage, target.hp);
+    target.hp = Math.max(0, target.hp - actualDamage);
+    const burnOwner = players.get(burn.ownerId);
+    if (burnOwner) burnOwner.damageDealt += actualDamage;
 
     broadcast({
         type: 'status_damage',
         target_player_id: target.id,
         killer_id: burn.ownerId || '',
-        damage,
+        damage: actualDamage,
         hp: target.hp,
         effect: 'burn'
     });
@@ -424,6 +437,8 @@ function applyBurnTick(target, now) {
     if (target.hp <= 0 && target.lifeState === 'alive') {
         broadcastKill(burn.ownerId, target, burn.shotId, now);
         target.burn = null;
+    } else {
+        broadcastScoreboard();
     }
 }
 
@@ -567,14 +582,20 @@ function registerHit(ws, message) {
     }
 
     damage = clamp(Math.floor(damage), 1, MAX_DAMAGE);
-    target.hp = Math.max(0, target.hp - damage);
+    const actualDamage = Math.min(damage, target.hp);
+    target.hp = Math.max(0, target.hp - actualDamage);
+
+    // Server-authoritative match statistics: +10 for an accepted hit,
+    // and damage counts only the HP actually removed.
+    shooter.score += 10;
+    shooter.damageDealt += actualDamage;
 
     broadcast({
         type: 'projectile_hit',
         player_id: shooter.id,
         target_player_id: target.id,
         shot_id: shot.id,
-        damage,
+        damage: actualDamage,
         hp: target.hp,
         x: message.x,
         y: message.y,
@@ -584,6 +605,8 @@ function registerHit(ws, message) {
 
     if (target.hp <= 0 && target.lifeState === 'alive') {
         broadcastKill(shooter.id, target, shot.id, now);
+    } else {
+        broadcastScoreboard();
     }
 }
 
@@ -688,6 +711,17 @@ function handleMessage(ws, message) {
     }
 
     switch (message.type) {
+        case 'pong': {
+            const player = getPlayer(ws);
+            if (!player || !Number.isSafeInteger(message.ping_id)) return;
+            const sentAt = player.pingPending.get(message.ping_id);
+            if (sentAt === undefined) return;
+            player.pingPending.delete(message.ping_id);
+            player.ping = Math.max(0, Date.now() - sentAt);
+            broadcastScoreboard();
+            break;
+        }
+
         case 'client_ready': {
             const player = getPlayer(ws);
             if (!player) return;
@@ -735,6 +769,9 @@ function handleMessage(ws, message) {
                 type: 'scoreboard',
                 players: [...players.values()].map(player => ({
                     id: player.id,
+                    score: player.score,
+                    damage_dealt: player.damageDealt,
+                    ping: player.ping,
                     kills: player.kills,
                     deaths: player.deaths,
                     life_state: player.lifeState
@@ -799,6 +836,10 @@ wss.on('connection', (ws) => {
         lifeState: 'alive',
         hp: 100,
         burn: null,
+        score: 0,
+        damageDealt: 0,
+        ping: 0,
+        pingPending: new Map(),
         kills: 0,
         deaths: 0,
         ready: false,
@@ -857,6 +898,22 @@ const cleanupTimer = setInterval(() => {
     for (const player of players.values()) applyBurnTick(player, now);
 }, 100);
 
+let nextPingId = 1;
+const pingTimer = setInterval(() => {
+    for (const player of players.values()) {
+        if (!isOpen(player.ws)) continue;
+        const pingId = nextPingId++;
+        player.pingPending.set(pingId, Date.now());
+        while (player.pingPending.size > 120) {
+            const oldest = player.pingPending.keys().next().value;
+            player.pingPending.delete(oldest);
+        }
+        if (!send(player.ws, { type: 'ping', ping_id: pingId })) {
+            player.pingPending.delete(pingId);
+        }
+    }
+}, 1000);
+
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
     log(`Max players: ${MAX_PLAYERS}`);
@@ -865,6 +922,7 @@ wss.on('listening', () => {
 function shutdown() {
     log('Shutting down...');
     clearInterval(cleanupTimer);
+    clearInterval(pingTimer);
 
     for (const ws of wss.clients) {
         try {

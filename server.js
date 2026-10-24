@@ -24,6 +24,14 @@ const BALANCE = {
     BASE_DAMAGE: 30,
     MIN_DAMAGE: 1,
     PROJECTILE_LIFETIME_SEC: 1.5,
+    // Angle is measured away from a perpendicular hit on the nearest
+    // side of the target's rectangular hull hitbox.
+    PENETRATION_FULL_DAMAGE_ANGLE_DEG: 5,
+    PENETRATION_RICOCHET_ANGLE_DEG: 80,
+    PENETRATION_MAX_CHANCE: 0.98,
+    // Defold tank.go collision box half extents (36.5 x 40 units).
+    TANK_HITBOX_HALF_WIDTH: 36.5,
+    TANK_HITBOX_HALF_HEIGHT: 40.0,
     CRITICAL_CHANCE: 0.15,
     CRITICAL_MAX_BONUS_MULTIPLIER: 1.5,
     CRITICAL_MAX_ANGLE_DEG: 15,
@@ -358,11 +366,70 @@ function randomChance(chance) {
     return Math.random() < clamp(chance, 0, 1);
 }
 
-// Orientation estimate: 0 degrees is a frontal hit, 90 degrees is grazing.
-function getImpactAngleDeg(shot, target) {
-    const raw = Math.abs(shot.angle - target.body_angle);
-    const wrapped = Math.abs(Math.atan2(Math.sin(raw), Math.cos(raw)));
-    return Math.abs(180 - wrapped * 180 / Math.PI);
+// Returns an angle relative to the normal of the nearest hitbox side:
+// 0 degrees = perpendicular hit; 90 degrees = fully grazing.
+// Hit coordinates are transformed into the target hull's local space so
+// front, rear, left and right sides are evaluated independently.
+function getImpactAngleDeg(shot, target, hitX, hitY) {
+    if (!isNumber(target.x) || !isNumber(target.y) ||
+        !isNumber(hitX) || !isNumber(hitY)) {
+        // Defensive fallback for incomplete state/hit data.
+        const raw = Math.abs(shot.angle - target.body_angle);
+        const wrapped = Math.abs(Math.atan2(Math.sin(raw), Math.cos(raw)));
+        return clamp(Math.abs(180 - wrapped * 180 / Math.PI), 0, 90);
+    }
+
+    const dx = hitX - target.x;
+    const dy = hitY - target.y;
+    const bodyAngle = target.body_angle || 0;
+    const cos = Math.cos(bodyAngle);
+    const sin = Math.sin(bodyAngle);
+
+    // Inverse 2D rotation into the target's local hull coordinates.
+    const localX = dx * cos + dy * sin;
+    const localY = -dx * sin + dy * cos;
+
+    const distanceToXSide = Math.abs(BALANCE.TANK_HITBOX_HALF_WIDTH - Math.abs(localX));
+    const distanceToYSide = Math.abs(BALANCE.TANK_HITBOX_HALF_HEIGHT - Math.abs(localY));
+
+    let sideNormalAngle;
+    if (distanceToXSide < distanceToYSide) {
+        // Local +X/-X sides; angle convention matches the turret's shot angle.
+        sideNormalAngle = bodyAngle + (localX >= 0 ? -Math.PI / 2 : Math.PI / 2);
+    } else {
+        // Local +Y/-Y (front/rear) sides.
+        sideNormalAngle = bodyAngle + (localY >= 0 ? 0 : Math.PI);
+    }
+
+    // A projectile travelling perpendicular into the selected side points
+    // opposite that side's outward normal.
+    const incomingAngle = sideNormalAngle + Math.PI;
+    const difference = Math.atan2(
+        Math.sin(shot.angle - incomingAngle),
+        Math.cos(shot.angle - incomingAngle)
+    );
+
+    return clamp(Math.abs(difference) * 180 / Math.PI, 0, 90);
+}
+
+function getPenetrationChance(angleDeg) {
+    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) return 0;
+    if (angleDeg <= BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) {
+        return BALANCE.PENETRATION_MAX_CHANCE;
+    }
+
+    const progress = (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
+        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+    return BALANCE.PENETRATION_MAX_CHANCE * (1 - progress);
+}
+
+function getAngleDamageMultiplier(angleDeg) {
+    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) return 0;
+    if (angleDeg <= BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) return 1;
+
+    const progress = (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
+        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+    return 1 - progress;
 }
 
 function calculateBaseDamage(shot, now) {
@@ -430,6 +497,9 @@ function applyBurnTick(target, now) {
         target_player_id: target.id,
         killer_id: burn.ownerId || '',
         damage: actualDamage,
+        penetration_chance: Math.round(penetrationChance * 100),
+        ricochet,
+        angle_damage_multiplier: Math.round(angleDamageMultiplier * 100),
         hp: target.hp,
         effect: 'burn'
     });
@@ -537,7 +607,11 @@ function registerHit(ws, message) {
 
     // Never trust client-supplied damage or effect flags.
     let damage = calculateBaseDamage(shot, now);
-    const impactAngleDeg = getImpactAngleDeg(shot, target);
+    const impactAngleDeg = getImpactAngleDeg(shot, target, message.x, message.y);
+    const penetrationChance = getPenetrationChance(impactAngleDeg);
+    const angleDamageMultiplier = getAngleDamageMultiplier(impactAngleDeg);
+    const ricochet = impactAngleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG ||
+        !randomChance(penetrationChance);
     const flightProgress = clamp(
         ((now - shot.createdAt) / 1000) / BALANCE.PROJECTILE_LIFETIME_SEC, 0, 1
     );
@@ -550,20 +624,20 @@ function registerHit(ws, message) {
         burn_duration: 0
     };
 
-    if (impactAngleDeg <= BALANCE.CRITICAL_MAX_ANGLE_DEG &&
+    if (!ricochet && impactAngleDeg <= BALANCE.CRITICAL_MAX_ANGLE_DEG &&
         randomChance(BALANCE.CRITICAL_CHANCE)) {
         damage = Math.round(damage * (
             1 + BALANCE.CRITICAL_MAX_BONUS_MULTIPLIER * distanceFactor
         ));
         effects.critical = true;
     }
-    if (randomChance(BALANCE.SLOW_CHANCE_POINT_BLANK * distanceFactor)) {
+    if (!ricochet && randomChance(BALANCE.SLOW_CHANCE_POINT_BLANK * distanceFactor)) {
         effects.slow_duration = BALANCE.SLOW_DURATION_SEC;
     }
-    if (randomChance(BALANCE.STUN_CHANCE_POINT_BLANK * distanceFactor)) {
+    if (!ricochet && randomChance(BALANCE.STUN_CHANCE_POINT_BLANK * distanceFactor)) {
         effects.stun_duration = BALANCE.STUN_DURATION_SEC;
     }
-    if (randomChance(BALANCE.GUN_DAMAGE_CHANCE)) {
+    if (!ricochet && randomChance(BALANCE.GUN_DAMAGE_CHANCE)) {
         effects.gun_damage_reloads = BALANCE.GUN_DAMAGE_RELOADS;
     }
 
@@ -571,7 +645,7 @@ function registerHit(ws, message) {
     const burnChance = BALANCE.BURN_MIN_CHANCE +
         (BALANCE.BURN_MAX_CHANCE - BALANCE.BURN_MIN_CHANCE) *
         Math.sin(angle * Math.PI / 90);
-    if (randomChance(burnChance)) {
+    if (!ricochet && randomChance(burnChance)) {
         effects.burn_duration = BALANCE.BURN_DURATION_SEC;
         target.burn = {
             ownerId: shooter.id,
@@ -581,7 +655,11 @@ function registerHit(ws, message) {
         };
     }
 
-    damage = clamp(Math.floor(damage), 1, MAX_DAMAGE);
+    // Angle penalty is applied to the final distance/critical-adjusted damage.
+    // Perpendicular hits within +/-5 degrees keep 100% damage; at 80 degrees
+    // and beyond the shot ricochets for exactly 0 damage.
+    damage = ricochet ? 0 : Math.floor(damage * angleDamageMultiplier);
+    damage = clamp(damage, 0, MAX_DAMAGE);
     const actualDamage = Math.min(damage, target.hp);
     target.hp = Math.max(0, target.hp - actualDamage);
 
@@ -596,6 +674,9 @@ function registerHit(ws, message) {
         target_player_id: target.id,
         shot_id: shot.id,
         damage: actualDamage,
+        penetration_chance: Math.round(penetrationChance * 100),
+        ricochet,
+        angle_damage_multiplier: Math.round(angleDamageMultiplier * 100),
         hp: target.hp,
         x: message.x,
         y: message.y,

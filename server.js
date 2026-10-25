@@ -1216,11 +1216,19 @@ function handleMessage(ws, message) {
 
             player.pingPending.delete(message.ping_id);
 
-            player.ping = Math.max(0, Date.now() - sentAt);
+const now = Date.now();
 
-            if (player.inBattle) {
-                broadcastScoreboard();
-            }
+// Не позволяем старому ответу перезаписать более свежий результат.
+if (sentAt < player.lastPingSampleAt) {
+    break;
+}
+
+player.lastPingSampleAt = sentAt;
+player.ping = Math.max(0, now - sentAt);
+
+if (player.inBattle) {
+    broadcastScoreboard();
+}
 
             break;
         }
@@ -1392,6 +1400,7 @@ wss.on('connection', (ws) => {
         score: 0,
         damageDealt: 0,
         ping: 0,
+        lastPingSampleAt: 0,
         pingPending: new Map(),
 
         kills: 0,

@@ -1,3 +1,4 @@
+
 'use strict';
 
 const WebSocket = require('ws');
@@ -16,7 +17,7 @@ const SHOT_INTERVAL_MS = 250;
 const HIT_INTERVAL_MS = 20;
 const SHOT_TTL_MS = 10000;
 const MAX_SHOTS_PER_PLAYER = 128;
-const RESPAWN_DELAY_MS = 500;
+const RESPAWN_DELAY_MS = 1500;
 const MAX_DAMAGE = 100;
 
 // Central PvP combat tuning.
@@ -24,24 +25,29 @@ const BALANCE = {
     BASE_DAMAGE: 30,
     MIN_DAMAGE: 1,
     PROJECTILE_LIFETIME_SEC: 1.5,
-    // Angle is measured away from a perpendicular hit on the nearest
-    // side of the target's rectangular hull hitbox.
+
     PENETRATION_FULL_DAMAGE_ANGLE_DEG: 5,
     PENETRATION_RICOCHET_ANGLE_DEG: 80,
     PENETRATION_MAX_CHANCE: 0.98,
-    // Defold tank.go collision box half extents (36.5 x 40 units).
+
+    // Defold tank.go collision box half extents.
     TANK_HITBOX_HALF_WIDTH: 36.5,
     TANK_HITBOX_HALF_HEIGHT: 40.0,
+
     CRITICAL_CHANCE: 0.15,
     CRITICAL_MAX_BONUS_MULTIPLIER: 1.5,
     CRITICAL_MAX_ANGLE_DEG: 15,
+
     SLOW_CHANCE_POINT_BLANK: 0.12,
     SLOW_DURATION_SEC: 7,
+
     STUN_CHANCE_POINT_BLANK: 0.10,
     STUN_DURATION_SEC: 5,
+
     GUN_DAMAGE_CHANCE: 0.05,
     GUN_DAMAGE_RELOADS: 3,
     GUN_DAMAGE_RELOAD_PENALTY: 0.50,
+
     BURN_MAX_CHANCE: 0.15,
     BURN_MIN_CHANCE: 0.01,
     BURN_DURATION_SEC: 3,
@@ -49,6 +55,7 @@ const BALANCE = {
     BURN_TICK_DAMAGE_MIN: 5,
     BURN_TICK_DAMAGE_MAX: 7
 };
+
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
@@ -58,12 +65,16 @@ const wss = new WebSocket.Server({
     maxPayload: MAX_MESSAGE_BYTES
 });
 
+// All connected WebSocket clients, including players in the menu.
 const players = new Map();
+
+// Registered server-approved projectiles.
 const shots = new Map();
 const shotKeys = new Map();
 
 let nextPlayerId = 1;
 let nextShotId = 1;
+let nextPingId = 1;
 
 const spawnPoints = [
     { x: -400, y: -400 },
@@ -73,6 +84,10 @@ const spawnPoints = [
     { x: 0, y: 400 },
     { x: 400, y: 400 }
 ];
+
+// -----------------------------------------------------------------------------
+// General helpers
+// -----------------------------------------------------------------------------
 
 function log(...args) {
     console.log('[SERVER]', ...args);
@@ -109,23 +124,46 @@ function send(ws, payload) {
     }
 }
 
-function broadcast(payload, exceptWs = null) {
-    const encoded = JSON.stringify(payload);
-
-    for (const client of wss.clients) {
-        if (client !== exceptWs && isOpen(client)) {
-            try {
-                client.send(encoded);
-            } catch (error) {
-                log('Broadcast error:', error.message);
-            }
-        }
-    }
+function sendError(ws, message) {
+    send(ws, {
+        type: 'error',
+        message
+    });
 }
 
 function getPlayer(ws) {
-    if (!ws.playerId) return null;
+    if (!ws || !ws.playerId) return null;
     return players.get(ws.playerId) || null;
+}
+
+function isMatchPlayer(player) {
+    return !!player && player.inBattle === true;
+}
+
+function isAlive(player) {
+    return !!player && player.lifeState === 'alive';
+}
+
+function hasPosition(player) {
+    return !!player &&
+        isNumber(player.x) &&
+        isNumber(player.y);
+}
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function randomChance(chance) {
+    return Math.random() < clamp(chance, 0, 1);
+}
+
+function resetPlayerPosition(player) {
+    player.x = null;
+    player.y = null;
+    player.body_angle = 0;
+    player.turret_angle = 0;
+    player.state_seq = 0;
 }
 
 function publicPlayer(player) {
@@ -138,6 +176,7 @@ function publicPlayer(player) {
         state_seq: player.state_seq,
         spawn_index: player.spawn_index,
         life_state: player.lifeState,
+        in_battle: player.inBattle,
         hp: player.hp,
         score: player.score,
         damage_dealt: player.damageDealt,
@@ -147,34 +186,62 @@ function publicPlayer(player) {
     };
 }
 
-function sendError(ws, message) {
-    send(ws, {
-        type: 'error',
-        message
-    });
+// Broadcast only to players currently participating in the match.
+// Clients in the main menu continue receiving their individual ping messages,
+// but never receive match events or occupy match slots.
+function broadcastToMatch(payload, exceptPlayerId = null) {
+    const encoded = JSON.stringify(payload);
+
+    for (const player of players.values()) {
+        if (!player.inBattle) continue;
+        if (player.id === exceptPlayerId) continue;
+        if (!isOpen(player.ws)) continue;
+
+        try {
+            player.ws.send(encoded);
+        } catch (error) {
+            log('Match broadcast error:', error.message);
+        }
+    }
 }
 
-function isAlive(player) {
-    return player &&
-        player.lifeState === 'alive';
+function getMatchPlayers(exceptPlayerId = null) {
+    return [...players.values()]
+        .filter(player =>
+            player.inBattle &&
+            player.id !== exceptPlayerId
+        );
 }
 
-function hasPosition(player) {
-    return player &&
-        isNumber(player.x) &&
-        isNumber(player.y);
+function countMatchPlayers() {
+    let count = 0;
+
+    for (const player of players.values()) {
+        if (player.inBattle) count++;
+    }
+
+    return count;
 }
 
-function resetPlayerPosition(player) {
-    player.x = null;
-    player.y = null;
-    player.body_angle = 0;
-    player.turret_angle = 0;
-    player.state_seq = 0;
+function getAvailableSpawnIndex() {
+    const occupied = new Set();
+
+    for (const player of players.values()) {
+        if (player.inBattle &&
+            Number.isInteger(player.spawn_index)) {
+            occupied.add(player.spawn_index);
+        }
+    }
+
+    for (let i = 0; i < spawnPoints.length; i++) {
+        if (!occupied.has(i)) return i;
+    }
+
+    return -1;
 }
 
 function broadcastScoreboard() {
-    const list = [...players.values()]
+    const list = getMatchPlayers()
         .sort((a, b) =>
             b.score - a.score ||
             b.kills - a.kills ||
@@ -190,22 +257,178 @@ function broadcastScoreboard() {
             life_state: player.lifeState
         }));
 
-    broadcast({
+    broadcastToMatch({
         type: 'scoreboard',
         players: list
     });
 }
 
+// A newly connected client is not yet a match participant.
+// Its spawn index remains null until enter_battle is accepted.
 function sendWelcome(ws, player) {
     send(ws, {
         type: 'welcome',
         player_id: player.id,
-        spawn_index: player.spawn_index,
-        players: [...players.values()]
-            .filter(other => other.id !== player.id)
-            .map(publicPlayer)
+        spawn_index: null,
+        in_battle: false,
+        players: []
     });
 }
+
+// -----------------------------------------------------------------------------
+// Match lifecycle
+// -----------------------------------------------------------------------------
+
+function removeShotsOwnedBy(playerId) {
+    for (const [shotId, shot] of shots) {
+        if (shot.ownerId === playerId) {
+            shots.delete(shotId);
+            shotKeys.delete(shot.key);
+        }
+    }
+}
+
+function clearBurnsOwnedBy(playerId) {
+    for (const target of players.values()) {
+        if (target.burn && target.burn.ownerId === playerId) {
+            target.burn = null;
+
+            if (target.inBattle) {
+                send(target.ws, {
+                    type: 'status_effect_expired',
+                    target_player_id: target.id,
+                    effect: 'burn'
+                });
+            }
+        }
+    }
+}
+
+function enterBattle(ws) {
+    const player = getPlayer(ws);
+
+    if (!player) return;
+
+    // Idempotent: a duplicate enter request must not allocate another slot.
+    if (player.inBattle) {
+        send(ws, {
+            type: 'enter_battle_accepted',
+            player_id: player.id,
+            spawn_index: player.spawn_index,
+            players: getMatchPlayers(player.id).map(publicPlayer)
+        });
+        return;
+    }
+
+    if (countMatchPlayers() >= MAX_PLAYERS) {
+        send(ws, {
+            type: 'enter_battle_rejected',
+            reason: 'match_full'
+        });
+        return;
+    }
+
+    const spawnIndex = getAvailableSpawnIndex();
+
+    if (spawnIndex < 0) {
+        send(ws, {
+            type: 'enter_battle_rejected',
+            reason: 'no_spawn_available'
+        });
+        return;
+    }
+
+    player.inBattle = true;
+    player.spawn_index = spawnIndex;
+
+    player.lifeState = 'alive';
+    player.hp = 100;
+    player.burn = null;
+
+    player.lastStateAt = 0;
+    player.lastShotAt = 0;
+    player.lastHitAt = 0;
+    player.deathAt = null;
+    player.inactiveAt = null;
+
+    resetPlayerPosition(player);
+
+    // Send existing match participants to the joining client first.
+    send(ws, {
+        type: 'enter_battle_accepted',
+        player_id: player.id,
+        spawn_index: player.spawn_index,
+        players: getMatchPlayers(player.id).map(publicPlayer)
+    });
+
+    // Announce the joining participant to the other match clients.
+    broadcastToMatch({
+        type: 'player_joined',
+        player: publicPlayer(player)
+    }, player.id);
+
+    broadcastScoreboard();
+
+    log(
+        'Player entered battle:',
+        player.id,
+        `spawn=${player.spawn_index}`,
+        `players=${countMatchPlayers()}/${MAX_PLAYERS}`
+    );
+}
+
+function leaveBattle(ws, reason = 'left_battle') {
+    const player = getPlayer(ws);
+
+    if (!player) return;
+
+    if (!player.inBattle) {
+        send(ws, {
+            type: 'leave_battle_accepted'
+        });
+        return;
+    }
+
+    const playerId = player.id;
+
+    // Mark the player as outside the match before broadcasting.
+    // This ensures the leaving client will not receive its own match events.
+    player.inBattle = false;
+    player.lifeState = 'inactive';
+    player.inactiveAt = null;
+    player.deathAt = null;
+    player.burn = null;
+
+    resetPlayerPosition(player);
+
+    // A client that leaves cannot report future collisions for its shots.
+    removeShotsOwnedBy(playerId);
+
+    // Prevent ongoing burns from crediting a player who left the match.
+    clearBurnsOwnedBy(playerId);
+
+    broadcastToMatch({
+        type: 'player_left',
+        player_id: playerId,
+        reason
+    });
+
+    send(ws, {
+        type: 'leave_battle_accepted'
+    });
+
+    broadcastScoreboard();
+
+    log(
+        'Player left battle:',
+        playerId,
+        `players=${countMatchPlayers()}/${MAX_PLAYERS}`
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Projectile registration and cleanup
+// -----------------------------------------------------------------------------
 
 function countPlayerShots(playerId) {
     let count = 0;
@@ -228,30 +451,20 @@ function pruneShots() {
     }
 }
 
-function setInactive(player, reason = 'inactive') {
-    if (!player) return;
-
-    if (player.lifeState === 'inactive') return;
-
-    player.lifeState = 'inactive';
-    player.inactiveAt = Date.now();
-    resetPlayerPosition(player);
-
-    broadcast({
-        type: 'player_inactive',
-        player_id: player.id,
-        reason
-    });
-
-    broadcastScoreboard();
-}
-
 function registerShot(ws, message) {
     const player = getPlayer(ws);
 
-    if (!player) return;
+    if (!isMatchPlayer(player)) {
+        send(ws, {
+            type: 'shot_rejected',
+            client_shot_id: message.shot_id || '',
+            reason: 'not_in_battle'
+        });
+        return;
+    }
 
-    // A dead or inactive player cannot create a new shot.
+    // A dead or inactive player cannot create a new projectile.
+    // Previously registered projectiles can still score a later hit.
     if (!isAlive(player) || !hasPosition(player)) {
         send(ws, {
             type: 'shot_rejected',
@@ -339,15 +552,14 @@ function registerShot(ws, message) {
     shots.set(shotId, shot);
     shotKeys.set(key, shotId);
 
-    // Notify the shooter that the server accepted this exact shot.
     send(ws, {
         type: 'shot_registered',
         client_shot_id: clientShotId,
         shot_id: shotId
     });
 
-    // Remote clients only need this for visual replication.
-    broadcast({
+    // Only other match participants need visual projectile replication.
+    broadcastToMatch({
         type: 'shot',
         player_id: player.id,
         shot_id: shotId,
@@ -355,151 +567,235 @@ function registerShot(ws, message) {
         y: shot.y,
         z: shot.z,
         angle: shot.angle
-    }, ws);
+    }, player.id);
 }
 
-function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
-}
+// -----------------------------------------------------------------------------
+// Server-authoritative penetration, damage and status effects
+// -----------------------------------------------------------------------------
 
-function randomChance(chance) {
-    return Math.random() < clamp(chance, 0, 1);
-}
-
-// Returns an angle relative to the normal of the nearest hitbox side:
+// Returns the impact angle relative to the normal of the nearest hull side.
 // 0 degrees = perpendicular hit; 90 degrees = fully grazing.
+//
 // Hit coordinates are transformed into the target hull's local space so
 // front, rear, left and right sides are evaluated independently.
 function getImpactAngleDeg(shot, target, hitX, hitY) {
     if (!isNumber(target.x) || !isNumber(target.y) ||
         !isNumber(hitX) || !isNumber(hitY)) {
-        // Defensive fallback for incomplete state/hit data.
         const raw = Math.abs(shot.angle - target.body_angle);
-        const wrapped = Math.abs(Math.atan2(Math.sin(raw), Math.cos(raw)));
-        return clamp(Math.abs(180 - wrapped * 180 / Math.PI), 0, 90);
+        const wrapped = Math.abs(
+            Math.atan2(Math.sin(raw), Math.cos(raw))
+        );
+
+        return clamp(
+            Math.abs(180 - wrapped * 180 / Math.PI),
+            0,
+            90
+        );
     }
 
     const dx = hitX - target.x;
     const dy = hitY - target.y;
     const bodyAngle = target.body_angle || 0;
+
     const cos = Math.cos(bodyAngle);
     const sin = Math.sin(bodyAngle);
 
-    // Inverse 2D rotation into the target's local hull coordinates.
     const localX = dx * cos + dy * sin;
     const localY = -dx * sin + dy * cos;
 
-    const distanceToXSide = Math.abs(BALANCE.TANK_HITBOX_HALF_WIDTH - Math.abs(localX));
-    const distanceToYSide = Math.abs(BALANCE.TANK_HITBOX_HALF_HEIGHT - Math.abs(localY));
+    const distanceToXSide = Math.abs(
+        BALANCE.TANK_HITBOX_HALF_WIDTH - Math.abs(localX)
+    );
+
+    const distanceToYSide = Math.abs(
+        BALANCE.TANK_HITBOX_HALF_HEIGHT - Math.abs(localY)
+    );
 
     let sideNormalAngle;
+
     if (distanceToXSide < distanceToYSide) {
-        // Local +X/-X sides; angle convention matches the turret's shot angle.
-        sideNormalAngle = bodyAngle + (localX >= 0 ? -Math.PI / 2 : Math.PI / 2);
+        sideNormalAngle = bodyAngle +
+            (localX >= 0 ? -Math.PI / 2 : Math.PI / 2);
     } else {
-        // Local +Y/-Y (front/rear) sides.
-        sideNormalAngle = bodyAngle + (localY >= 0 ? 0 : Math.PI);
+        sideNormalAngle = bodyAngle +
+            (localY >= 0 ? 0 : Math.PI);
     }
 
-    // A projectile travelling perpendicular into the selected side points
-    // opposite that side's outward normal.
     const incomingAngle = sideNormalAngle + Math.PI;
+
     const difference = Math.atan2(
         Math.sin(shot.angle - incomingAngle),
         Math.cos(shot.angle - incomingAngle)
     );
 
-    return clamp(Math.abs(difference) * 180 / Math.PI, 0, 90);
+    return clamp(
+        Math.abs(difference) * 180 / Math.PI,
+        0,
+        90
+    );
 }
 
 function getPenetrationChance(angleDeg) {
-    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) return 0;
+    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) {
+        return 0;
+    }
+
     if (angleDeg <= BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) {
         return BALANCE.PENETRATION_MAX_CHANCE;
     }
 
-    const progress = (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
-        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+    const progress =
+        (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
+        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG -
+            BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+
     return BALANCE.PENETRATION_MAX_CHANCE * (1 - progress);
 }
 
 function getAngleDamageMultiplier(angleDeg) {
-    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) return 0;
-    if (angleDeg <= BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) return 1;
+    if (angleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG) {
+        return 0;
+    }
 
-    const progress = (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
-        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+    if (angleDeg <= BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) {
+        return 1;
+    }
+
+    const progress =
+        (angleDeg - BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG) /
+        (BALANCE.PENETRATION_RICOCHET_ANGLE_DEG -
+            BALANCE.PENETRATION_FULL_DAMAGE_ANGLE_DEG);
+
     return 1 - progress;
 }
 
 function calculateBaseDamage(shot, now) {
     const elapsed = Math.max(0, (now - shot.createdAt) / 1000);
-    const progress = clamp(elapsed / BALANCE.PROJECTILE_LIFETIME_SEC, 0, 1);
-    return Math.max(0, Math.round(
-        BALANCE.BASE_DAMAGE +
-        (BALANCE.MIN_DAMAGE - BALANCE.BASE_DAMAGE) * progress
-    ));
+
+    const progress = clamp(
+        elapsed / BALANCE.PROJECTILE_LIFETIME_SEC,
+        0,
+        1
+    );
+
+    return Math.max(
+        0,
+        Math.round(
+            BALANCE.BASE_DAMAGE +
+            (BALANCE.MIN_DAMAGE - BALANCE.BASE_DAMAGE) * progress
+        )
+    );
 }
 
 function broadcastKill(killerId, target, shotId, now) {
-    if (!target || target.lifeState !== 'alive') return false;
+    if (!target ||
+        !target.inBattle ||
+        target.lifeState !== 'alive') {
+        return false;
+    }
+
     target.lifeState = 'dead';
     target.deathAt = now;
+    target.inactiveAt = null;
     target.deaths++;
+    target.burn = null;
 
-    const killer = typeof killerId === 'string' ? players.get(killerId) : null;
-    if (killer && killer.id !== target.id) {
+    const possibleKiller = typeof killerId === 'string'
+        ? players.get(killerId)
+        : null;
+
+    // The killer may already be dead: a projectile registered before death
+    // is still allowed to earn the frag. The killer must still be in the match.
+    const killer = possibleKiller &&
+        possibleKiller.inBattle &&
+        possibleKiller.id !== target.id
+        ? possibleKiller
+        : null;
+
+    if (killer) {
         killer.kills++;
         killer.score += 100;
     }
 
-    broadcast({
+    broadcastToMatch({
         type: 'kill_feed',
         killer_id: killer ? killer.id : 'WORLD',
         victim_id: target.id,
         shot_id: shotId || ''
     });
-    broadcast({
+
+    broadcastToMatch({
         type: 'player_killed',
         killer_id: killer ? killer.id : 'WORLD',
         victim_id: target.id,
         shot_id: shotId || ''
     });
+
     broadcastScoreboard();
-    log(`${killer ? killer.id : 'WORLD'} killed ${target.id}${shotId ? ` with ${shotId}` : ' with burn'}`);
+
+    log(
+        `${killer ? killer.id : 'WORLD'} killed ${target.id}` +
+        `${shotId ? ` with ${shotId}` : ' with burn'}`
+    );
+
     return true;
 }
 
 function applyBurnTick(target, now) {
     const burn = target.burn;
-    if (!burn || target.lifeState !== 'alive') {
+
+    if (!burn ||
+        !target.inBattle ||
+        target.lifeState !== 'alive') {
         target.burn = null;
         return;
     }
+
     if (now >= burn.endsAt) {
         target.burn = null;
-        broadcast({ type: 'status_effect_expired', target_player_id: target.id, effect: 'burn' });
+
+        send(target.ws, {
+            type: 'status_effect_expired',
+            target_player_id: target.id,
+            effect: 'burn'
+        });
+
         return;
     }
+
     if (now < burn.nextTickAt) return;
 
-    burn.nextTickAt = now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000;
-    const damage = BALANCE.BURN_TICK_DAMAGE_MIN + Math.floor(
-        Math.random() * (BALANCE.BURN_TICK_DAMAGE_MAX - BALANCE.BURN_TICK_DAMAGE_MIN + 1)
-    );
-    const actualDamage = Math.min(damage, target.hp);
-    target.hp = Math.max(0, target.hp - actualDamage);
-    const burnOwner = players.get(burn.ownerId);
-    if (burnOwner) burnOwner.damageDealt += actualDamage;
+    burn.nextTickAt =
+        now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000;
 
-    broadcast({
+    const damage =
+        BALANCE.BURN_TICK_DAMAGE_MIN +
+        Math.floor(
+            Math.random() *
+            (BALANCE.BURN_TICK_DAMAGE_MAX -
+                BALANCE.BURN_TICK_DAMAGE_MIN + 1)
+        );
+
+    const actualDamage = Math.min(damage, target.hp);
+
+    target.hp = Math.max(0, target.hp - actualDamage);
+
+    const burnOwner = players.get(burn.ownerId);
+
+    if (burnOwner &&
+        burnOwner.inBattle &&
+        burnOwner.id !== target.id) {
+        burnOwner.damageDealt += actualDamage;
+    }
+
+    // Burn ticks do not use projectile penetration variables.
+    // This also avoids the previous ReferenceError in applyBurnTick().
+    broadcastToMatch({
         type: 'status_damage',
         target_player_id: target.id,
         killer_id: burn.ownerId || '',
         damage: actualDamage,
-        penetration_chance: Math.round(penetrationChance * 100),
-        ricochet,
-        angle_damage_multiplier: Math.round(angleDamageMultiplier * 100),
         hp: target.hp,
         effect: 'burn'
     });
@@ -512,13 +808,24 @@ function applyBurnTick(target, now) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Hit validation and damage application
+// -----------------------------------------------------------------------------
+
 function registerHit(ws, message) {
     const shooter = getPlayer(ws);
 
-    if (!shooter) return;
+    if (!isMatchPlayer(shooter)) {
+        send(ws, {
+            type: 'hit_rejected',
+            client_shot_id: message.shot_id || '',
+            reason: 'not_in_battle'
+        });
+        return;
+    }
 
-    // Intentionally do not require the shooter to be alive here.
-    // A projectile fired before death may still hit its target.
+    // Do not require the shooter to be alive.
+    // A previously registered projectile may hit after its owner dies.
 
     const clientShotId = message.shot_id;
 
@@ -545,7 +852,10 @@ function registerHit(ws, message) {
         return;
     }
 
-    if (Date.now() - shot.createdAt > SHOT_TTL_MS) {
+    const now = Date.now();
+    const shotAge = now - shot.createdAt;
+
+    if (shotAge > SHOT_TTL_MS) {
         send(ws, {
             type: 'hit_rejected',
             client_shot_id: clientShotId,
@@ -554,7 +864,8 @@ function registerHit(ws, message) {
         return;
     }
 
-    if (Date.now() - shot.createdAt > BALANCE.PROJECTILE_LIFETIME_SEC * 1000 + 250) {
+    if (shotAge >
+        BALANCE.PROJECTILE_LIFETIME_SEC * 1000 + 250) {
         send(ws, {
             type: 'hit_rejected',
             client_shot_id: clientShotId,
@@ -564,11 +875,15 @@ function registerHit(ws, message) {
     }
 
     const targetId = message.target_player_id;
+
     const target = typeof targetId === 'string'
         ? players.get(targetId)
         : null;
 
-    if (!target || target.id === shooter.id || !isAlive(target)) {
+    if (!target ||
+        !target.inBattle ||
+        target.id === shooter.id ||
+        !isAlive(target)) {
         send(ws, {
             type: 'hit_rejected',
             client_shot_id: clientShotId,
@@ -586,8 +901,6 @@ function registerHit(ws, message) {
         return;
     }
 
-    const now = Date.now();
-
     if (now - shooter.lastHitAt < HIT_INTERVAL_MS) {
         send(ws, {
             type: 'hit_rejected',
@@ -597,8 +910,13 @@ function registerHit(ws, message) {
         return;
     }
 
-    if (!validCoordinate(message.x) || !validCoordinate(message.y)) {
-        send(ws, { type: 'hit_rejected', client_shot_id: clientShotId, reason: 'invalid_hit_data' });
+    if (!validCoordinate(message.x) ||
+        !validCoordinate(message.y)) {
+        send(ws, {
+            type: 'hit_rejected',
+            client_shot_id: clientShotId,
+            reason: 'invalid_hit_data'
+        });
         return;
     }
 
@@ -607,15 +925,33 @@ function registerHit(ws, message) {
 
     // Never trust client-supplied damage or effect flags.
     let damage = calculateBaseDamage(shot, now);
-    const impactAngleDeg = getImpactAngleDeg(shot, target, message.x, message.y);
-    const penetrationChance = getPenetrationChance(impactAngleDeg);
-    const angleDamageMultiplier = getAngleDamageMultiplier(impactAngleDeg);
-    const ricochet = impactAngleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG ||
-        !randomChance(penetrationChance);
-    const flightProgress = clamp(
-        ((now - shot.createdAt) / 1000) / BALANCE.PROJECTILE_LIFETIME_SEC, 0, 1
+
+    const impactAngleDeg = getImpactAngleDeg(
+        shot,
+        target,
+        message.x,
+        message.y
     );
+
+    const penetrationChance =
+        getPenetrationChance(impactAngleDeg);
+
+    const angleDamageMultiplier =
+        getAngleDamageMultiplier(impactAngleDeg);
+
+    const ricochet =
+        impactAngleDeg >= BALANCE.PENETRATION_RICOCHET_ANGLE_DEG ||
+        !randomChance(penetrationChance);
+
+    const flightProgress = clamp(
+        ((now - shot.createdAt) / 1000) /
+            BALANCE.PROJECTILE_LIFETIME_SEC,
+        0,
+        1
+    );
+
     const distanceFactor = 1 - flightProgress;
+
     const effects = {
         critical: false,
         slow_duration: 0,
@@ -624,51 +960,75 @@ function registerHit(ws, message) {
         burn_duration: 0
     };
 
-    if (!ricochet && impactAngleDeg <= BALANCE.CRITICAL_MAX_ANGLE_DEG &&
+    if (!ricochet &&
+        impactAngleDeg <= BALANCE.CRITICAL_MAX_ANGLE_DEG &&
         randomChance(BALANCE.CRITICAL_CHANCE)) {
-        damage = Math.round(damage * (
-            1 + BALANCE.CRITICAL_MAX_BONUS_MULTIPLIER * distanceFactor
-        ));
+        damage = Math.round(
+            damage * (
+                1 + BALANCE.CRITICAL_MAX_BONUS_MULTIPLIER *
+                    distanceFactor
+            )
+        );
+
         effects.critical = true;
     }
-    if (!ricochet && randomChance(BALANCE.SLOW_CHANCE_POINT_BLANK * distanceFactor)) {
+
+    if (!ricochet &&
+        randomChance(
+            BALANCE.SLOW_CHANCE_POINT_BLANK * distanceFactor
+        )) {
         effects.slow_duration = BALANCE.SLOW_DURATION_SEC;
     }
-    if (!ricochet && randomChance(BALANCE.STUN_CHANCE_POINT_BLANK * distanceFactor)) {
+
+    if (!ricochet &&
+        randomChance(
+            BALANCE.STUN_CHANCE_POINT_BLANK * distanceFactor
+        )) {
         effects.stun_duration = BALANCE.STUN_DURATION_SEC;
     }
-    if (!ricochet && randomChance(BALANCE.GUN_DAMAGE_CHANCE)) {
-        effects.gun_damage_reloads = BALANCE.GUN_DAMAGE_RELOADS;
+
+    if (!ricochet &&
+        randomChance(BALANCE.GUN_DAMAGE_CHANCE)) {
+        effects.gun_damage_reloads =
+            BALANCE.GUN_DAMAGE_RELOADS;
     }
 
     const angle = clamp(impactAngleDeg, 0, 90);
-    const burnChance = BALANCE.BURN_MIN_CHANCE +
+
+    const burnChance =
+        BALANCE.BURN_MIN_CHANCE +
         (BALANCE.BURN_MAX_CHANCE - BALANCE.BURN_MIN_CHANCE) *
-        Math.sin(angle * Math.PI / 90);
+            Math.sin(angle * Math.PI / 90);
+
     if (!ricochet && randomChance(burnChance)) {
         effects.burn_duration = BALANCE.BURN_DURATION_SEC;
+
         target.burn = {
             ownerId: shooter.id,
             shotId: shot.id,
             endsAt: now + BALANCE.BURN_DURATION_SEC * 1000,
-            nextTickAt: now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000
+            nextTickAt:
+                now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000
         };
     }
 
-    // Angle penalty is applied to the final distance/critical-adjusted damage.
-    // Perpendicular hits within +/-5 degrees keep 100% damage; at 80 degrees
-    // and beyond the shot ricochets for exactly 0 damage.
-    damage = ricochet ? 0 : Math.floor(damage * angleDamageMultiplier);
+    // Perpendicular hits keep full damage.
+    // At 80 degrees and beyond, the shot ricochets for 0 damage.
+    damage = ricochet
+        ? 0
+        : Math.floor(damage * angleDamageMultiplier);
+
     damage = clamp(damage, 0, MAX_DAMAGE);
+
     const actualDamage = Math.min(damage, target.hp);
+
     target.hp = Math.max(0, target.hp - actualDamage);
 
-    // Server-authoritative match statistics: +10 for an accepted hit,
-    // and damage counts only the HP actually removed.
+    // Server-authoritative statistics.
     shooter.score += 10;
     shooter.damageDealt += actualDamage;
 
-    broadcast({
+    broadcastToMatch({
         type: 'projectile_hit',
         player_id: shooter.id,
         target_player_id: target.id,
@@ -676,7 +1036,8 @@ function registerHit(ws, message) {
         damage: actualDamage,
         penetration_chance: Math.round(penetrationChance * 100),
         ricochet,
-        angle_damage_multiplier: Math.round(angleDamageMultiplier * 100),
+        angle_damage_multiplier:
+            Math.round(angleDamageMultiplier * 100),
         hp: target.hp,
         x: message.x,
         y: message.y,
@@ -691,12 +1052,21 @@ function registerHit(ws, message) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Position synchronization
+// -----------------------------------------------------------------------------
+
 function handleState(ws, message) {
     const player = getPlayer(ws);
 
-    if (!player) return;
+    if (!isMatchPlayer(player)) {
+        send(ws, {
+            type: 'state_rejected',
+            reason: 'not_in_battle'
+        });
+        return;
+    }
 
-    // State updates cannot revive dead/inactive players.
     if (!isAlive(player)) {
         send(ws, {
             type: 'state_rejected',
@@ -729,7 +1099,7 @@ function handleState(ws, message) {
     player.turret_angle = message.turret_angle;
     player.state_seq++;
 
-    broadcast({
+    broadcastToMatch({
         type: 'state',
         player_id: player.id,
         x: player.x,
@@ -737,13 +1107,42 @@ function handleState(ws, message) {
         body_angle: player.body_angle,
         turret_angle: player.turret_angle,
         state_seq: player.state_seq
-    }, ws);
+    }, player.id);
+}
+
+// -----------------------------------------------------------------------------
+// Death, inactivity and respawn
+// -----------------------------------------------------------------------------
+
+function setInactive(player, reason = 'inactive') {
+    if (!player || !player.inBattle) return;
+
+    if (player.lifeState === 'inactive') return;
+
+    player.lifeState = 'inactive';
+    player.inactiveAt = Date.now();
+
+    resetPlayerPosition(player);
+
+    broadcastToMatch({
+        type: 'player_inactive',
+        player_id: player.id,
+        reason
+    }, player.id);
+
+    broadcastScoreboard();
 }
 
 function requestRespawn(ws) {
     const player = getPlayer(ws);
 
-    if (!player) return;
+    if (!isMatchPlayer(player)) {
+        send(ws, {
+            type: 'respawn_rejected',
+            reason: 'not_in_battle'
+        });
+        return;
+    }
 
     if (player.lifeState === 'alive') {
         send(ws, {
@@ -754,7 +1153,8 @@ function requestRespawn(ws) {
     }
 
     const now = Date.now();
-    const transitionTime = player.deathAt || player.inactiveAt || now;
+    const transitionTime =
+        player.deathAt || player.inactiveAt || now;
 
     if (now - transitionTime < RESPAWN_DELAY_MS) {
         send(ws, {
@@ -767,11 +1167,14 @@ function requestRespawn(ws) {
     player.lifeState = 'alive';
     player.hp = 100;
     player.burn = null;
+
     player.lastShotAt = 0;
     player.lastHitAt = 0;
     player.lastStateAt = 0;
+
     player.deathAt = null;
     player.inactiveAt = null;
+
     resetPlayerPosition(player);
 
     send(ws, {
@@ -781,11 +1184,17 @@ function requestRespawn(ws) {
     });
 
     broadcastScoreboard();
+
     log(`${player.id} respawn accepted`);
 }
 
+// -----------------------------------------------------------------------------
+// Message routing
+// -----------------------------------------------------------------------------
+
 function handleMessage(ws, message) {
-    if (!message || typeof message !== 'object' ||
+    if (!message ||
+        typeof message !== 'object' ||
         typeof message.type !== 'string') {
         sendError(ws, 'Malformed message');
         return;
@@ -794,22 +1203,48 @@ function handleMessage(ws, message) {
     switch (message.type) {
         case 'pong': {
             const player = getPlayer(ws);
-            if (!player || !Number.isSafeInteger(message.ping_id)) return;
-            const sentAt = player.pingPending.get(message.ping_id);
+
+            if (!player ||
+                !Number.isSafeInteger(message.ping_id)) {
+                return;
+            }
+
+            const sentAt =
+                player.pingPending.get(message.ping_id);
+
             if (sentAt === undefined) return;
+
             player.pingPending.delete(message.ping_id);
+
             player.ping = Math.max(0, Date.now() - sentAt);
-            broadcastScoreboard();
+
+            if (player.inBattle) {
+                broadcastScoreboard();
+            }
+
             break;
         }
 
+        case 'enter_battle':
+            enterBattle(ws);
+            break;
+
+        case 'leave_battle':
+            leaveBattle(ws, 'left_battle');
+            break;
+
         case 'client_ready': {
+            // Compatibility with older clients.
+            // client_ready must NOT enroll a client into a match.
             const player = getPlayer(ws);
+
             if (!player) return;
 
-            player.ready = true;
-            send(ws, { type: 'ready' });
-            broadcastScoreboard();
+            send(ws, {
+                type: 'ready',
+                in_battle: player.inBattle
+            });
+
             break;
         }
 
@@ -827,10 +1262,10 @@ function handleMessage(ws, message) {
 
         case 'player_inactive': {
             const player = getPlayer(ws);
-            if (!player) return;
 
-            // The client may send this after its death animation / cleanup.
-            // Do not count a second death here.
+            if (!player || !player.inBattle) return;
+
+            // This notification does not add a second death.
             setInactive(player, 'tank_destroyed');
             break;
         }
@@ -838,27 +1273,49 @@ function handleMessage(ws, message) {
         case 'player_killed':
             // Kill credit and HP are decided by registered projectile hits.
             // Do not trust client-supplied killer_id.
-            log('Ignored client player_killed report from', ws.playerId);
+            log(
+                'Ignored client player_killed report from',
+                ws.playerId
+            );
             break;
 
         case 'player_respawn':
             requestRespawn(ws);
             break;
 
-        case 'request_scoreboard':
+        case 'request_scoreboard': {
+            const player = getPlayer(ws);
+
+            // A client in the menu must not receive match statistics.
+            if (!isMatchPlayer(player)) {
+                send(ws, {
+                    type: 'scoreboard',
+                    players: []
+                });
+                return;
+            }
+
             send(ws, {
                 type: 'scoreboard',
-                players: [...players.values()].map(player => ({
-                    id: player.id,
-                    score: player.score,
-                    damage_dealt: player.damageDealt,
-                    ping: player.ping,
-                    kills: player.kills,
-                    deaths: player.deaths,
-                    life_state: player.lifeState
-                }))
+                players: getMatchPlayers()
+                    .sort((a, b) =>
+                        b.score - a.score ||
+                        b.kills - a.kills ||
+                        a.deaths - b.deaths
+                    )
+                    .map(matchPlayer => ({
+                        id: matchPlayer.id,
+                        score: matchPlayer.score,
+                        damage_dealt: matchPlayer.damageDealt,
+                        ping: matchPlayer.ping,
+                        kills: matchPlayer.kills,
+                        deaths: matchPlayer.deaths,
+                        life_state: matchPlayer.lifeState
+                    }))
             });
+
             break;
+        }
 
         default:
             sendError(ws, `Unknown message type: ${message.type}`);
@@ -866,67 +1323,84 @@ function handleMessage(ws, message) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Disconnect handling
+// -----------------------------------------------------------------------------
+
 function removePlayer(ws) {
     const player = getPlayer(ws);
+
     if (!player) return;
 
-    players.delete(player.id);
+    const playerId = player.id;
+    const wasInBattle = player.inBattle;
 
-    // Remove shots owned by a disconnected player. A disconnected client
-    // can no longer report collisions, so those projectiles cannot be
-    // validated by this protocol.
-    for (const [shotId, shot] of shots) {
-        if (shot.ownerId === player.id) {
-            shots.delete(shotId);
-            shotKeys.delete(shot.key);
-        }
+    // Remove from the match before broadcasting to remaining participants.
+    player.inBattle = false;
+
+    players.delete(playerId);
+
+    removeShotsOwnedBy(playerId);
+    clearBurnsOwnedBy(playerId);
+
+    if (wasInBattle) {
+        broadcastToMatch({
+            type: 'player_left',
+            player_id: playerId,
+            reason: 'disconnected'
+        });
+
+        broadcastScoreboard();
     }
 
-    broadcast({
-        type: 'player_left',
-        player_id: player.id
-    });
-
-    broadcastScoreboard();
-    log('Player disconnected:', player.id);
+    log(
+        'Player disconnected:',
+        playerId,
+        wasInBattle ? '(was in battle)' : '(was in menu)'
+    );
 }
 
-wss.on('connection', (ws) => {
-    if (players.size >= MAX_PLAYERS) {
-        send(ws, {
-            type: 'error',
-            message: 'Server is full'
-        });
-        ws.close(1008, 'Server full');
-        return;
-    }
+// -----------------------------------------------------------------------------
+// WebSocket connection
+// -----------------------------------------------------------------------------
 
+wss.on('connection', (ws) => {
+    // The connection limit is intentionally separate from MAX_PLAYERS.
+    // Menu clients can stay connected without occupying a match slot.
     const playerNumber = nextPlayerId++;
     const id = `P${playerNumber}`;
-    const spawnIndex = (playerNumber - 1) % spawnPoints.length;
 
     const player = {
         id,
         ws,
+
+        // Match participation is explicit.
+        inBattle: false,
+
         x: null,
         y: null,
         body_angle: 0,
         turret_angle: 0,
         state_seq: 0,
-        spawn_index: spawnIndex,
-        lifeState: 'alive',
+
+        spawn_index: null,
+
+        lifeState: 'inactive',
         hp: 100,
         burn: null,
+
         score: 0,
         damageDealt: 0,
         ping: 0,
         pingPending: new Map(),
+
         kills: 0,
         deaths: 0,
-        ready: false,
+
         lastStateAt: 0,
         lastShotAt: 0,
         lastHitAt: 0,
+
         deathAt: null,
         inactiveAt: null
     };
@@ -934,14 +1408,11 @@ wss.on('connection', (ws) => {
     ws.playerId = id;
     players.set(id, player);
 
+    // Connecting does not broadcast player_joined and does not alter
+    // the match scoreboard. The client is still in the menu at this point.
     sendWelcome(ws, player);
 
-    broadcast({
-        type: 'player_joined',
-        player: publicPlayer(player)
-    }, ws);
-
-    log('Player connected:', id);
+    log('WebSocket connected:', id, '(not yet in battle)');
 
     ws.on('message', (raw, isBinary) => {
         if (isBinary) {
@@ -961,7 +1432,11 @@ wss.on('connection', (ws) => {
         try {
             handleMessage(ws, message);
         } catch (error) {
-            log('Message handler error:', error.stack || error.message);
+            log(
+                'Message handler error:',
+                error.stack || error.message
+            );
+
             sendError(ws, 'Internal server error');
         }
     });
@@ -973,42 +1448,68 @@ wss.on('connection', (ws) => {
     });
 });
 
+// -----------------------------------------------------------------------------
+// Periodic cleanup and ping
+// -----------------------------------------------------------------------------
+
 const cleanupTimer = setInterval(() => {
     pruneShots();
+
     const now = Date.now();
-    for (const player of players.values()) applyBurnTick(player, now);
+
+    for (const player of players.values()) {
+        if (player.inBattle) {
+            applyBurnTick(player, now);
+        }
+    }
 }, 100);
 
-let nextPingId = 1;
 const pingTimer = setInterval(() => {
     for (const player of players.values()) {
         if (!isOpen(player.ws)) continue;
+
         const pingId = nextPingId++;
+
         player.pingPending.set(pingId, Date.now());
+
         while (player.pingPending.size > 120) {
-            const oldest = player.pingPending.keys().next().value;
+            const oldest =
+                player.pingPending.keys().next().value;
+
             player.pingPending.delete(oldest);
         }
-        if (!send(player.ws, { type: 'ping', ping_id: pingId })) {
+
+        if (!send(player.ws, {
+            type: 'ping',
+            ping_id: pingId
+        })) {
             player.pingPending.delete(pingId);
         }
     }
 }, 1000);
 
+// -----------------------------------------------------------------------------
+// Startup and graceful shutdown
+// -----------------------------------------------------------------------------
+
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
-    log(`Max players: ${MAX_PLAYERS}`);
+    log(`Max match players: ${MAX_PLAYERS}`);
+    log(`Spawn points: ${spawnPoints.length}`);
 });
 
 function shutdown() {
     log('Shutting down...');
+
     clearInterval(cleanupTimer);
     clearInterval(pingTimer);
 
     for (const ws of wss.clients) {
         try {
             ws.close(1001, 'Server shutting down');
-        } catch (_) {}
+        } catch (_) {
+            // Ignore shutdown errors.
+        }
     }
 
     wss.close(() => process.exit(0));

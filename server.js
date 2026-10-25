@@ -393,11 +393,17 @@ function leaveBattle(ws, reason = 'left_battle') {
 
     // Mark the player as outside the match before broadcasting.
     // This ensures the leaving client will not receive its own match events.
-    player.inBattle = false;
+     player.inBattle = false;
     player.lifeState = 'inactive';
     player.inactiveAt = null;
     player.deathAt = null;
     player.burn = null;
+
+    // Reset match statistics when the player leaves the battle.
+    player.score = 0;
+    player.damageDealt = 0;
+    player.kills = 0;
+    player.deaths = 0;
 
     resetPlayerPosition(player);
 
@@ -1048,7 +1054,7 @@ function registerHit(ws, message) {
     target.hp = Math.max(0, target.hp - actualDamage);
 
     // Server-authoritative statistics.
-    shooter.score += 10;
+    shooter.score += 1;
     shooter.damageDealt += actualDamage;
 
     broadcastToMatch({

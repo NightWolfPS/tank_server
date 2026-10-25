@@ -726,7 +726,7 @@ function broadcastKill(killerId, target, shotId, now) {
 
     if (killer) {
         killer.kills++;
-        killer.score += 100;
+        killer.score += 10;
     }
 
     broadcastToMatch({

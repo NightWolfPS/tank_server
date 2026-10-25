@@ -580,15 +580,21 @@ function registerShot(ws, message) {
 // Hit coordinates are transformed into the target hull's local space so
 // front, rear, left and right sides are evaluated independently.
 function getImpactAngleDeg(shot, target, hitX, hitY) {
-    if (!isNumber(target.x) || !isNumber(target.y) ||
-        !isNumber(hitX) || !isNumber(hitY)) {
-        const raw = Math.abs(shot.angle - target.body_angle);
-        const wrapped = Math.abs(
-            Math.atan2(Math.sin(raw), Math.cos(raw))
+    if (
+        !isNumber(target.x) ||
+        !isNumber(target.y) ||
+        !isNumber(hitX) ||
+        !isNumber(hitY)
+    ) {
+        const difference = Math.atan2(
+            Math.sin(shot.angle - (target.body_angle || 0)),
+            Math.cos(shot.angle - (target.body_angle || 0))
         );
 
+        const angle = Math.abs(difference) * 180 / Math.PI;
+
         return clamp(
-            Math.abs(180 - wrapped * 180 / Math.PI),
+            Math.abs(180 - angle),
             0,
             90
         );
@@ -598,6 +604,7 @@ function getImpactAngleDeg(shot, target, hitX, hitY) {
     const dy = hitY - target.y;
     const bodyAngle = target.body_angle || 0;
 
+    // Transform impact coordinates into tank-local space.
     const cos = Math.cos(bodyAngle);
     const sin = Math.sin(bodyAngle);
 
@@ -615,13 +622,17 @@ function getImpactAngleDeg(shot, target, hitX, hitY) {
     let sideNormalAngle;
 
     if (distanceToXSide < distanceToYSide) {
+        // Left/right side: normal points along local X.
         sideNormalAngle = bodyAngle +
-            (localX >= 0 ? -Math.PI / 2 : Math.PI / 2);
+            (localX >= 0 ? 0 : Math.PI);
     } else {
+        // Front/rear side: normal points along local Y.
         sideNormalAngle = bodyAngle +
-            (localY >= 0 ? 0 : Math.PI);
+            (localY >= 0 ? Math.PI / 2 : -Math.PI / 2);
     }
 
+    // Shot angle represents the actual travel direction,
+    // measured from world +X in radians.
     const incomingAngle = sideNormalAngle + Math.PI;
 
     const difference = Math.atan2(
@@ -1011,6 +1022,18 @@ function registerHit(ws, message) {
                 now + BALANCE.BURN_TICK_INTERVAL_SEC * 1000
         };
     }
+
+    log(
+    `HIT DEBUG: ${shooter.id} -> ${target.id}`,
+    `shot=${shot.id}`,
+    `base=${calculateBaseDamage(shot, now)}`,
+    `angle=${impactAngleDeg.toFixed(1)}deg`,
+    `penetration=${(penetrationChance * 100).toFixed(1)}%`,
+    `multiplier=${angleDamageMultiplier.toFixed(2)}`,
+    `ricochet=${ricochet}`,
+    `shotAngle=${shot.angle.toFixed(3)}`,
+    `bodyAngle=${(target.body_angle || 0).toFixed(3)}`
+);
 
     // Perpendicular hits keep full damage.
     // At 80 degrees and beyond, the shot ricochets for 0 damage.

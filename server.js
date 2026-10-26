@@ -19,6 +19,8 @@ const SHOT_TTL_MS = 10000;
 const MAX_SHOTS_PER_PLAYER = 128;
 const RESPAWN_DELAY_MS = 1500;
 const MAX_DAMAGE = 100;
+const CHAT_MAX_LENGTH = 120;
+const CHAT_INTERVAL_MS = 500;
 
 // Central PvP combat tuning.
 const BALANCE = {
@@ -203,6 +205,78 @@ function broadcastToMatch(payload, exceptPlayerId = null) {
             log('Match broadcast error:', error.message);
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Match chat
+// -----------------------------------------------------------------------------
+
+function handleChatMessage(ws, message) {
+    const player = getPlayer(ws);
+
+    // Only current match participants can use the chat.
+    if (!isMatchPlayer(player)) {
+        send(ws, {
+            type: 'chat_rejected',
+            reason: 'not_in_battle'
+        });
+        return;
+    }
+
+    if (typeof message.text !== 'string') {
+        send(ws, {
+            type: 'chat_rejected',
+            reason: 'invalid_message'
+        });
+        return;
+    }
+
+    // Remove control characters and trim whitespace.
+    const text = message.text
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+        .trim();
+
+    if (!text) {
+        send(ws, {
+            type: 'chat_rejected',
+            reason: 'empty_message'
+        });
+        return;
+    }
+
+    // Count Unicode code points instead of UTF-16 code units.
+    const characters = [...text];
+
+    if (characters.length > CHAT_MAX_LENGTH) {
+        send(ws, {
+            type: 'chat_rejected',
+            reason: 'message_too_long'
+        });
+        return;
+    }
+
+    const now = Date.now();
+
+    if (now - player.lastChatAt < CHAT_INTERVAL_MS) {
+        send(ws, {
+            type: 'chat_rejected',
+            reason: 'rate_limited'
+        });
+        return;
+    }
+
+    player.lastChatAt = now;
+
+    // The sender ID is taken from the server's player record.
+    // broadcastToMatch includes the sender and excludes menu clients.
+    broadcastToMatch({
+        type: 'chat_message',
+        player_id: player.id,
+        text,
+        timestamp: now
+    });
+
+    log(`CHAT ${player.id}: ${text}`);
 }
 
 function getMatchPlayers(exceptPlayerId = null) {
@@ -1230,6 +1304,11 @@ function handleMessage(ws, message) {
     }
 
     switch (message.type) {
+
+        case 'chat_send':
+            handleChatMessage(ws, message);
+        break;
+
         case 'pong': {
             const player = getPlayer(ws);
 
@@ -1438,6 +1517,7 @@ wss.on('connection', (ws) => {
         lastStateAt: 0,
         lastShotAt: 0,
         lastHitAt: 0,
+        lastChatAt: 0,
 
         deathAt: null,
         inactiveAt: null

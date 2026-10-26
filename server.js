@@ -2,6 +2,7 @@
 'use strict';
 
 const WebSocket = require('ws');
+const http = require('http');
 
 const HOST = '0.0.0.0';
 const PORT = Number(process.env.PORT) || 8080;
@@ -61,10 +62,18 @@ const BALANCE = {
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
+const httpServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Tank server is running');
+});
+
 const wss = new WebSocket.Server({
-    host: HOST,
-    port: PORT,
+    server: httpServer,
     maxPayload: MAX_MESSAGE_BYTES
+});
+
+httpServer.listen(PORT, HOST, () => {
+    console.log(`[SERVER] Listening on ${HOST}:${PORT}`);
 });
 
 // All connected WebSocket clients, including players in the menu.

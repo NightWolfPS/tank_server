@@ -1305,6 +1305,22 @@ function handleMessage(ws, message) {
 
     switch (message.type) {
 
+        case 'server_status': {
+            // Статус сервера для выбора из главного меню.
+            const playersInBattle = countMatchPlayers();
+
+            send(ws, {
+                type: 'server_status',
+                players_in_battle: playersInBattle,
+                max_players: MAX_PLAYERS,
+                available_slots: Math.max(
+                    0,
+                    MAX_PLAYERS - playersInBattle
+                )
+            });
+            break;
+        }
+
         case 'chat_send':
             handleChatMessage(ws, message);
         break;

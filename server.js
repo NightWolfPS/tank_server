@@ -1320,6 +1320,7 @@ function handleMessage(ws, message) {
 
             send(ws, {
                 type: 'server_status',
+                connected_users: players.size,
                 players_in_battle: playersInBattle,
                 max_players: MAX_PLAYERS,
                 available_slots: Math.max(

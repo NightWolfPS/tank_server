@@ -62,6 +62,15 @@ const BALANCE = {
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
+const VALID_HULL_IDS = new Set([
+    'light_hull'
+]);
+
+const VALID_TURRET_IDS = new Set([
+    'tank_turret',
+    'twin_barrel_turret'
+]);
+
 const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Tank server is running');
@@ -184,6 +193,11 @@ function publicPlayer(player) {
         y: player.y,
         body_angle: player.body_angle,
         turret_angle: player.turret_angle,
+
+        // Tank configuration for remote clients.
+        hull_id: player.hull_id || 'light_hull',
+        turret_id: player.turret_id || 'tank_turret',
+
         state_seq: player.state_seq,
         spawn_index: player.spawn_index,
         life_state: player.lifeState,
@@ -1204,22 +1218,36 @@ function handleState(ws, message) {
         return;
     }
 
-    player.lastStateAt = now;
     player.x = message.x;
-    player.y = message.y;
-    player.body_angle = message.body_angle;
-    player.turret_angle = message.turret_angle;
-    player.state_seq++;
+player.y = message.y;
+player.body_angle = message.body_angle;
+player.turret_angle = message.turret_angle;
+
+// Preserve valid tank loadout selections sent by the client.
+if (VALID_HULL_IDS.has(message.hull_id)) {
+    player.hull_id = message.hull_id;
+}
+
+if (VALID_TURRET_IDS.has(message.turret_id)) {
+    player.turret_id = message.turret_id;
+}
+
+player.state_seq++;
 
     broadcastToMatch({
-        type: 'state',
-        player_id: player.id,
-        x: player.x,
-        y: player.y,
-        body_angle: player.body_angle,
-        turret_angle: player.turret_angle,
-        state_seq: player.state_seq
-    }, player.id);
+    type: 'state',
+    player_id: player.id,
+    x: player.x,
+    y: player.y,
+    body_angle: player.body_angle,
+    turret_angle: player.turret_angle,
+
+    // Replicate the selected hull and turret to remote clients.
+    hull_id: player.hull_id || 'light_hull',
+    turret_id: player.turret_id || 'tank_turret',
+
+    state_seq: player.state_seq
+}, player.id);
 }
 
 // -----------------------------------------------------------------------------
@@ -1524,6 +1552,8 @@ wss.on('connection', (ws) => {
         body_angle: 0,
         turret_angle: 0,
         state_seq: 0,
+        hull_id: 'light_hull',
+        turret_id: 'tank_turret',
 
         spawn_index: null,
 

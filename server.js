@@ -82,6 +82,15 @@ const VALID_HULL_IDS = new Set([
     'weight_hull'
 ]);
 
+const HULL_MAX_HP = {
+    light_hull: 100,
+    weight_hull: 225
+};
+
+function getHullMaxHp(hullId) {
+    return HULL_MAX_HP[hullId] || HULL_MAX_HP.light_hull;
+}
+
 const VALID_TURRET_IDS = new Set([
     'tank_turret',
     'twin_barrel_turret'
@@ -505,7 +514,7 @@ function enterBattle(ws) {
     player.spawn_index = spawnIndex;
 
     player.lifeState = 'alive';
-    player.hp = 100;
+    player.hp = getHullMaxHp(player.hull_id);
     player.burn = null;
 
     player.lastStateAt = 0;
@@ -1363,7 +1372,7 @@ function requestRespawn(ws) {
     }
 
     player.lifeState = 'alive';
-    player.hp = 100;
+    player.hp = getHullMaxHp(player.hull_id);
     player.burn = null;
 
     player.lastShotAt = 0;
@@ -1605,7 +1614,7 @@ wss.on('connection', (ws) => {
         spawn_index: null,
 
         lifeState: 'inactive',
-        hp: 100,
+        hp: getHullMaxHp('light_hull'),
         burn: null,
 
         score: 0,

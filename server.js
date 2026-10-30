@@ -37,7 +37,7 @@ const BALANCE = {
     TANK_HITBOX_HALF_HEIGHT: 40.0,
 
     CRITICAL_CHANCE: 0.15,
-    CRITICAL_MAX_BONUS_MULTIPLIER: 1.5,
+    CRITICAL_MAX_MULTIPLIER: 1.5,
     CRITICAL_MAX_ANGLE_DEG: 15,
 
     SLOW_CHANCE_POINT_BLANK: 0.12,
@@ -227,6 +227,7 @@ function publicPlayer(player) {
         life_state: player.lifeState,
         in_battle: player.inBattle,
         hp: player.hp,
+        max_hp: getHullMaxHp(player.hull_id),
         score: player.score,
         damage_dealt: player.damageDealt,
         ping: player.ping,
@@ -477,7 +478,7 @@ function clearBurnsOwnedBy(playerId) {
     }
 }
 
-function enterBattle(ws) {
+function enterBattle(ws, message = {}) {
     const player = getPlayer(ws);
 
     if (!player) return;
@@ -508,6 +509,19 @@ function enterBattle(ws) {
             reason: 'no_spawn_available'
         });
         return;
+    }
+
+    // Apply the selected garage loadout BEFORE initializing HP.
+    // The first state packet arrives after battle entry and must not decide
+    // whether a heavy hull starts with light-hull durability.
+    if (typeof message.hull_id === 'string' &&
+        VALID_HULL_IDS.has(message.hull_id)) {
+        player.hull_id = message.hull_id;
+    }
+
+    if (typeof message.turret_id === 'string' &&
+        VALID_TURRET_IDS.has(message.turret_id)) {
+        player.turret_id = message.turret_id;
     }
 
     player.inBattle = true;
@@ -986,6 +1000,7 @@ function applyBurnTick(target, now) {
         killer_id: burn.ownerId || '',
         damage: actualDamage,
         hp: target.hp,
+        max_hp: getHullMaxHp(target.hull_id),
         effect: 'burn'
     });
 
@@ -1151,7 +1166,7 @@ function registerHit(ws, message) {
         randomChance(BALANCE.CRITICAL_CHANCE)) {
         damage = Math.round(
             damage * (
-                1 + BALANCE.CRITICAL_MAX_BONUS_MULTIPLIER *
+                1 + (BALANCE.CRITICAL_MAX_MULTIPLIER - 1) *
                     distanceFactor
             )
         );
@@ -1234,6 +1249,7 @@ function registerHit(ws, message) {
         angle_damage_multiplier:
             Math.round(angleDamageMultiplier * 100),
         hp: target.hp,
+        max_hp: getHullMaxHp(target.hull_id),
         x: message.x,
         y: message.y,
         effects,
@@ -1294,13 +1310,8 @@ function handleState(ws, message) {
     player.body_angle = message.body_angle;
     player.turret_angle = message.turret_angle;
 
-    if (VALID_HULL_IDS.has(message.hull_id)) {
-        player.hull_id = message.hull_id;
-    }
-
-    if (VALID_TURRET_IDS.has(message.turret_id)) {
-        player.turret_id = message.turret_id;
-    }
+    // Loadout is fixed by the enter_battle message. Do not let stale or
+    // delayed movement-state packets overwrite the selected hull/turret.
 
     player.state_seq++;
 
@@ -1313,6 +1324,8 @@ function handleState(ws, message) {
         turret_angle: player.turret_angle,
         hull_id: player.hull_id || 'light_hull',
         turret_id: player.turret_id || 'tank_turret',
+        hp: player.hp,
+        max_hp: getHullMaxHp(player.hull_id),
         state_seq: player.state_seq
     }, player.id);
 }
@@ -1324,7 +1337,8 @@ function handleState(ws, message) {
 function setInactive(player, reason = 'inactive') {
     if (!player || !player.inBattle) return;
 
-    if (player.lifeState === 'inactive') return;
+    if (player.lifeState === 'inactive' ||
+        player.lifeState === 'dead') return;
 
     player.lifeState = 'inactive';
     player.inactiveAt = Date.now();
@@ -1461,7 +1475,7 @@ function handleMessage(ws, message) {
         }
 
         case 'enter_battle':
-            enterBattle(ws);
+            enterBattle(ws, message);
             break;
 
         case 'leave_battle':

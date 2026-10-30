@@ -1,4 +1,3 @@
-
 'use strict';
 
 const WebSocket = require('ws');
@@ -27,13 +26,13 @@ const CHAT_INTERVAL_MS = 500;
 const BALANCE = {
     BASE_DAMAGE: 30,
     MIN_DAMAGE: 1,
+
     PROJECTILE_LIFETIME_SEC: 1.5,
 
     PENETRATION_FULL_DAMAGE_ANGLE_DEG: 5,
     PENETRATION_RICOCHET_ANGLE_DEG: 80,
     PENETRATION_MAX_CHANCE: 0.98,
 
-    // Defold tank.go collision box half extents.
     TANK_HITBOX_HALF_WIDTH: 36.5,
     TANK_HITBOX_HALF_HEIGHT: 40.0,
 
@@ -59,11 +58,28 @@ const BALANCE = {
     BURN_TICK_DAMAGE_MAX: 7
 };
 
+// Allowed projectile profile limits.
+// Client values are validated before being stored on the server.
+const PROJECTILE_LIMITS = {
+    DAMAGE_MIN: 0,
+    DAMAGE_MAX: 100,
+
+    MIN_DAMAGE_MIN: 0,
+    MIN_DAMAGE_MAX: 100,
+
+    SPEED_MIN: 1,
+    SPEED_MAX: 5000,
+
+    LIFETIME_MIN: 0.05,
+    LIFETIME_MAX: 10
+};
+
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
 const VALID_HULL_IDS = new Set([
-    'light_hull'
+    'light_hull',
+    'weight_hull'
 ]);
 
 const VALID_TURRET_IDS = new Set([
@@ -194,7 +210,6 @@ function publicPlayer(player) {
         body_angle: player.body_angle,
         turret_angle: player.turret_angle,
 
-        // Tank configuration for remote clients.
         hull_id: player.hull_id || 'light_hull',
         turret_id: player.turret_id || 'tank_turret',
 
@@ -211,9 +226,6 @@ function publicPlayer(player) {
     };
 }
 
-// Broadcast only to players currently participating in the match.
-// Clients in the main menu continue receiving their individual ping messages,
-// but never receive match events or occupy match slots.
 function broadcastToMatch(payload, exceptPlayerId = null) {
     const encoded = JSON.stringify(payload);
 
@@ -231,13 +243,74 @@ function broadcastToMatch(payload, exceptPlayerId = null) {
 }
 
 // -----------------------------------------------------------------------------
+// Projectile profile validation
+// -----------------------------------------------------------------------------
+
+function createProjectileProfile(message) {
+    const projectile = message.projectile;
+
+    // Backward compatibility with older clients.
+    if (projectile === undefined || projectile === null) {
+        return {
+            damage: BALANCE.BASE_DAMAGE,
+            min_damage: BALANCE.MIN_DAMAGE,
+            speed: 500,
+            lifetime: BALANCE.PROJECTILE_LIFETIME_SEC
+        };
+    }
+
+    if (typeof projectile !== 'object' ||
+        Array.isArray(projectile)) {
+        return null;
+    }
+
+    const {
+        damage,
+        min_damage,
+        speed,
+        lifetime
+    } = projectile;
+
+    if (!isNumber(damage) ||
+        damage < PROJECTILE_LIMITS.DAMAGE_MIN ||
+        damage > PROJECTILE_LIMITS.DAMAGE_MAX) {
+        return null;
+    }
+
+    if (!isNumber(min_damage) ||
+        min_damage < PROJECTILE_LIMITS.MIN_DAMAGE_MIN ||
+        min_damage > PROJECTILE_LIMITS.MIN_DAMAGE_MAX ||
+        min_damage > damage) {
+        return null;
+    }
+
+    if (!isNumber(speed) ||
+        speed < PROJECTILE_LIMITS.SPEED_MIN ||
+        speed > PROJECTILE_LIMITS.SPEED_MAX) {
+        return null;
+    }
+
+    if (!isNumber(lifetime) ||
+        lifetime < PROJECTILE_LIMITS.LIFETIME_MIN ||
+        lifetime > PROJECTILE_LIMITS.LIFETIME_MAX) {
+        return null;
+    }
+
+    return {
+        damage,
+        min_damage,
+        speed,
+        lifetime
+    };
+}
+
+// -----------------------------------------------------------------------------
 // Match chat
 // -----------------------------------------------------------------------------
 
 function handleChatMessage(ws, message) {
     const player = getPlayer(ws);
 
-    // Only current match participants can use the chat.
     if (!isMatchPlayer(player)) {
         send(ws, {
             type: 'chat_rejected',
@@ -254,7 +327,6 @@ function handleChatMessage(ws, message) {
         return;
     }
 
-    // Remove control characters and trim whitespace.
     const text = message.text
         .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
         .trim();
@@ -267,7 +339,6 @@ function handleChatMessage(ws, message) {
         return;
     }
 
-    // Count Unicode code points instead of UTF-16 code units.
     const characters = [...text];
 
     if (characters.length > CHAT_MAX_LENGTH) {
@@ -290,8 +361,6 @@ function handleChatMessage(ws, message) {
 
     player.lastChatAt = now;
 
-    // The sender ID is taken from the server's player record.
-    // broadcastToMatch includes the sender and excludes menu clients.
     broadcastToMatch({
         type: 'chat_message',
         player_id: player.id,
@@ -360,8 +429,6 @@ function broadcastScoreboard() {
     });
 }
 
-// A newly connected client is not yet a match participant.
-// Its spawn index remains null until enter_battle is accepted.
 function sendWelcome(ws, player) {
     send(ws, {
         type: 'welcome',
@@ -406,7 +473,6 @@ function enterBattle(ws) {
 
     if (!player) return;
 
-    // Idempotent: a duplicate enter request must not allocate another slot.
     if (player.inBattle) {
         send(ws, {
             type: 'enter_battle_accepted',
@@ -450,7 +516,6 @@ function enterBattle(ws) {
 
     resetPlayerPosition(player);
 
-    // Send existing match participants to the joining client first.
     send(ws, {
         type: 'enter_battle_accepted',
         player_id: player.id,
@@ -458,7 +523,6 @@ function enterBattle(ws) {
         players: getMatchPlayers(player.id).map(publicPlayer)
     });
 
-    // Announce the joining participant to the other match clients.
     broadcastToMatch({
         type: 'player_joined',
         player: publicPlayer(player)
@@ -488,15 +552,12 @@ function leaveBattle(ws, reason = 'left_battle') {
 
     const playerId = player.id;
 
-    // Mark the player as outside the match before broadcasting.
-    // This ensures the leaving client will not receive its own match events.
-     player.inBattle = false;
+    player.inBattle = false;
     player.lifeState = 'inactive';
     player.inactiveAt = null;
     player.deathAt = null;
     player.burn = null;
 
-    // Reset match statistics when the player leaves the battle.
     player.score = 0;
     player.damageDealt = 0;
     player.kills = 0;
@@ -504,10 +565,7 @@ function leaveBattle(ws, reason = 'left_battle') {
 
     resetPlayerPosition(player);
 
-    // A client that leaves cannot report future collisions for its shots.
     removeShotsOwnedBy(playerId);
-
-    // Prevent ongoing burns from crediting a player who left the match.
     clearBurnsOwnedBy(playerId);
 
     broadcastToMatch({
@@ -566,8 +624,6 @@ function registerShot(ws, message) {
         return;
     }
 
-    // A dead or inactive player cannot create a new projectile.
-    // Previously registered projectiles can still score a later hit.
     if (!isAlive(player) || !hasPosition(player)) {
         send(ws, {
             type: 'shot_rejected',
@@ -613,6 +669,18 @@ function registerShot(ws, message) {
         return;
     }
 
+    // Validate the projectile profile before registering the shot.
+    const projectileProfile = createProjectileProfile(message);
+
+    if (!projectileProfile) {
+        send(ws, {
+            type: 'shot_rejected',
+            client_shot_id: clientShotId,
+            reason: 'invalid_projectile_profile'
+        });
+        return;
+    }
+
     const key = `${player.id}:${clientShotId}`;
 
     if (shotKeys.has(key)) {
@@ -644,10 +712,15 @@ function registerShot(ws, message) {
         key,
         clientShotId,
         ownerId: player.id,
+
         x: message.x,
         y: message.y,
         z: message.z,
         angle: message.angle,
+
+        // Immutable projectile profile for this registered shot.
+        projectile: projectileProfile,
+
         createdAt: now,
         hitTargets: new Set()
     };
@@ -661,7 +734,6 @@ function registerShot(ws, message) {
         shot_id: shotId
     });
 
-    // Only other match participants need visual projectile replication.
     broadcastToMatch({
         type: 'shot',
         player_id: player.id,
@@ -669,7 +741,10 @@ function registerShot(ws, message) {
         x: shot.x,
         y: shot.y,
         z: shot.z,
-        angle: shot.angle
+        angle: shot.angle,
+
+        // Remote clients receive the same projectile profile.
+        projectile: shot.projectile
     }, player.id);
 }
 
@@ -677,11 +752,6 @@ function registerShot(ws, message) {
 // Server-authoritative penetration, damage and status effects
 // -----------------------------------------------------------------------------
 
-// Returns the impact angle relative to the normal of the nearest hull side.
-// 0 degrees = perpendicular hit; 90 degrees = fully grazing.
-//
-// Hit coordinates are transformed into the target hull's local space so
-// front, rear, left and right sides are evaluated independently.
 function getImpactAngleDeg(shot, target, hitX, hitY) {
     if (
         !isNumber(target.x) ||
@@ -707,7 +777,6 @@ function getImpactAngleDeg(shot, target, hitX, hitY) {
     const dy = hitY - target.y;
     const bodyAngle = target.body_angle || 0;
 
-    // Transform impact coordinates into tank-local space.
     const cos = Math.cos(bodyAngle);
     const sin = Math.sin(bodyAngle);
 
@@ -725,17 +794,13 @@ function getImpactAngleDeg(shot, target, hitX, hitY) {
     let sideNormalAngle;
 
     if (distanceToXSide < distanceToYSide) {
-        // Left/right side: normal points along local X.
         sideNormalAngle = bodyAngle +
             (localX >= 0 ? 0 : Math.PI);
     } else {
-        // Front/rear side: normal points along local Y.
         sideNormalAngle = bodyAngle +
             (localY >= 0 ? Math.PI / 2 : -Math.PI / 2);
     }
 
-    // Shot angle represents the actual travel direction,
-    // measured from world +X in radians.
     const incomingAngle = sideNormalAngle + Math.PI;
 
     const difference = Math.atan2(
@@ -785,10 +850,15 @@ function getAngleDamageMultiplier(angleDeg) {
 }
 
 function calculateBaseDamage(shot, now) {
-    const elapsed = Math.max(0, (now - shot.createdAt) / 1000);
+    const profile = shot.projectile;
+
+    const elapsed = Math.max(
+        0,
+        (now - shot.createdAt) / 1000
+    );
 
     const progress = clamp(
-        elapsed / BALANCE.PROJECTILE_LIFETIME_SEC,
+        elapsed / profile.lifetime,
         0,
         1
     );
@@ -796,8 +866,8 @@ function calculateBaseDamage(shot, now) {
     return Math.max(
         0,
         Math.round(
-            BALANCE.BASE_DAMAGE +
-            (BALANCE.MIN_DAMAGE - BALANCE.BASE_DAMAGE) * progress
+            profile.damage +
+            (profile.min_damage - profile.damage) * progress
         )
     );
 }
@@ -819,8 +889,6 @@ function broadcastKill(killerId, target, shotId, now) {
         ? players.get(killerId)
         : null;
 
-    // The killer may already be dead: a projectile registered before death
-    // is still allowed to earn the frag. The killer must still be in the match.
     const killer = possibleKiller &&
         possibleKiller.inBattle &&
         possibleKiller.id !== target.id
@@ -903,8 +971,6 @@ function applyBurnTick(target, now) {
         burnOwner.damageDealt += actualDamage;
     }
 
-    // Burn ticks do not use projectile penetration variables.
-    // This also avoids the previous ReferenceError in applyBurnTick().
     broadcastToMatch({
         type: 'status_damage',
         target_player_id: target.id,
@@ -937,9 +1003,6 @@ function registerHit(ws, message) {
         });
         return;
     }
-
-    // Do not require the shooter to be alive.
-    // A previously registered projectile may hit after its owner dies.
 
     const clientShotId = message.shot_id;
 
@@ -979,7 +1042,7 @@ function registerHit(ws, message) {
     }
 
     if (shotAge >
-        BALANCE.PROJECTILE_LIFETIME_SEC * 1000 + 250) {
+        shot.projectile.lifetime * 1000 + 250) {
         send(ws, {
             type: 'hit_rejected',
             client_shot_id: clientShotId,
@@ -1037,7 +1100,7 @@ function registerHit(ws, message) {
     shooter.lastHitAt = now;
     shot.hitTargets.add(target.id);
 
-    // Never trust client-supplied damage or effect flags.
+    // Damage comes from the projectile profile stored at shot registration.
     let damage = calculateBaseDamage(shot, now);
 
     const impactAngleDeg = getImpactAngleDeg(
@@ -1059,7 +1122,7 @@ function registerHit(ws, message) {
 
     const flightProgress = clamp(
         ((now - shot.createdAt) / 1000) /
-            BALANCE.PROJECTILE_LIFETIME_SEC,
+            shot.projectile.lifetime,
         0,
         1
     );
@@ -1127,19 +1190,17 @@ function registerHit(ws, message) {
     }
 
     log(
-    `HIT DEBUG: ${shooter.id} -> ${target.id}`,
-    `shot=${shot.id}`,
-    `base=${calculateBaseDamage(shot, now)}`,
-    `angle=${impactAngleDeg.toFixed(1)}deg`,
-    `penetration=${(penetrationChance * 100).toFixed(1)}%`,
-    `multiplier=${angleDamageMultiplier.toFixed(2)}`,
-    `ricochet=${ricochet}`,
-    `shotAngle=${shot.angle.toFixed(3)}`,
-    `bodyAngle=${(target.body_angle || 0).toFixed(3)}`
-);
+        `HIT DEBUG: ${shooter.id} -> ${target.id}`,
+        `shot=${shot.id}`,
+        `base=${calculateBaseDamage(shot, now)}`,
+        `angle=${impactAngleDeg.toFixed(1)}deg`,
+        `penetration=${(penetrationChance * 100).toFixed(1)}%`,
+        `multiplier=${angleDamageMultiplier.toFixed(2)}`,
+        `ricochet=${ricochet}`,
+        `shotAngle=${shot.angle.toFixed(3)}`,
+        `bodyAngle=${(target.body_angle || 0).toFixed(3)}`
+    );
 
-    // Perpendicular hits keep full damage.
-    // At 80 degrees and beyond, the shot ricochets for 0 damage.
     damage = ricochet
         ? 0
         : Math.floor(damage * angleDamageMultiplier);
@@ -1150,7 +1211,6 @@ function registerHit(ws, message) {
 
     target.hp = Math.max(0, target.hp - actualDamage);
 
-    // Server-authoritative statistics.
     shooter.score += 1;
     shooter.damageDealt += actualDamage;
 
@@ -1218,36 +1278,34 @@ function handleState(ws, message) {
         return;
     }
 
+    player.lastStateAt = now;
+
     player.x = message.x;
-player.y = message.y;
-player.body_angle = message.body_angle;
-player.turret_angle = message.turret_angle;
+    player.y = message.y;
+    player.body_angle = message.body_angle;
+    player.turret_angle = message.turret_angle;
 
-// Preserve valid tank loadout selections sent by the client.
-if (VALID_HULL_IDS.has(message.hull_id)) {
-    player.hull_id = message.hull_id;
-}
+    if (VALID_HULL_IDS.has(message.hull_id)) {
+        player.hull_id = message.hull_id;
+    }
 
-if (VALID_TURRET_IDS.has(message.turret_id)) {
-    player.turret_id = message.turret_id;
-}
+    if (VALID_TURRET_IDS.has(message.turret_id)) {
+        player.turret_id = message.turret_id;
+    }
 
-player.state_seq++;
+    player.state_seq++;
 
     broadcastToMatch({
-    type: 'state',
-    player_id: player.id,
-    x: player.x,
-    y: player.y,
-    body_angle: player.body_angle,
-    turret_angle: player.turret_angle,
-
-    // Replicate the selected hull and turret to remote clients.
-    hull_id: player.hull_id || 'light_hull',
-    turret_id: player.turret_id || 'tank_turret',
-
-    state_seq: player.state_seq
-}, player.id);
+        type: 'state',
+        player_id: player.id,
+        x: player.x,
+        y: player.y,
+        body_angle: player.body_angle,
+        turret_angle: player.turret_angle,
+        hull_id: player.hull_id || 'light_hull',
+        turret_id: player.turret_id || 'tank_turret',
+        state_seq: player.state_seq
+    }, player.id);
 }
 
 // -----------------------------------------------------------------------------
@@ -1343,7 +1401,6 @@ function handleMessage(ws, message) {
     switch (message.type) {
 
         case 'server_status': {
-            // Статус сервера для выбора из главного меню.
             const playersInBattle = countMatchPlayers();
 
             send(ws, {
@@ -1361,7 +1418,7 @@ function handleMessage(ws, message) {
 
         case 'chat_send':
             handleChatMessage(ws, message);
-        break;
+            break;
 
         case 'pong': {
             const player = getPlayer(ws);
@@ -1378,19 +1435,18 @@ function handleMessage(ws, message) {
 
             player.pingPending.delete(message.ping_id);
 
-const now = Date.now();
+            const now = Date.now();
 
-// Не позволяем старому ответу перезаписать более свежий результат.
-if (sentAt < player.lastPingSampleAt) {
-    break;
-}
+            if (sentAt < player.lastPingSampleAt) {
+                break;
+            }
 
-player.lastPingSampleAt = sentAt;
-player.ping = Math.max(0, now - sentAt);
+            player.lastPingSampleAt = sentAt;
+            player.ping = Math.max(0, now - sentAt);
 
-if (player.inBattle) {
-    broadcastScoreboard();
-}
+            if (player.inBattle) {
+                broadcastScoreboard();
+            }
 
             break;
         }
@@ -1404,8 +1460,6 @@ if (player.inBattle) {
             break;
 
         case 'client_ready': {
-            // Compatibility with older clients.
-            // client_ready must NOT enroll a client into a match.
             const player = getPlayer(ws);
 
             if (!player) return;
@@ -1435,14 +1489,11 @@ if (player.inBattle) {
 
             if (!player || !player.inBattle) return;
 
-            // This notification does not add a second death.
             setInactive(player, 'tank_destroyed');
             break;
         }
 
         case 'player_killed':
-            // Kill credit and HP are decided by registered projectile hits.
-            // Do not trust client-supplied killer_id.
             log(
                 'Ignored client player_killed report from',
                 ws.playerId
@@ -1456,7 +1507,6 @@ if (player.inBattle) {
         case 'request_scoreboard': {
             const player = getPlayer(ws);
 
-            // A client in the menu must not receive match statistics.
             if (!isMatchPlayer(player)) {
                 send(ws, {
                     type: 'scoreboard',
@@ -1505,7 +1555,6 @@ function removePlayer(ws) {
     const playerId = player.id;
     const wasInBattle = player.inBattle;
 
-    // Remove from the match before broadcasting to remaining participants.
     player.inBattle = false;
 
     players.delete(playerId);
@@ -1535,8 +1584,6 @@ function removePlayer(ws) {
 // -----------------------------------------------------------------------------
 
 wss.on('connection', (ws) => {
-    // The connection limit is intentionally separate from MAX_PLAYERS.
-    // Menu clients can stay connected without occupying a match slot.
     const playerNumber = nextPlayerId++;
     const id = `P${playerNumber}`;
 
@@ -1544,7 +1591,6 @@ wss.on('connection', (ws) => {
         id,
         ws,
 
-        // Match participation is explicit.
         inBattle: false,
 
         x: null,
@@ -1552,6 +1598,7 @@ wss.on('connection', (ws) => {
         body_angle: 0,
         turret_angle: 0,
         state_seq: 0,
+
         hull_id: 'light_hull',
         turret_id: 'tank_turret',
 
@@ -1582,8 +1629,6 @@ wss.on('connection', (ws) => {
     ws.playerId = id;
     players.set(id, player);
 
-    // Connecting does not broadcast player_joined and does not alter
-    // the match scoreboard. The client is still in the menu at this point.
     sendWelcome(ws, player);
 
     log('WebSocket connected:', id, '(not yet in battle)');

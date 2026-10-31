@@ -2,6 +2,8 @@
 
 const WebSocket = require('ws');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const HOST = '0.0.0.0';
 const PORT = Number(process.env.PORT) || 8080;
@@ -13,7 +15,6 @@ const MAX_PLAYERS = Math.max(
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const STATE_INTERVAL_MS = 50;
-const SHOT_INTERVAL_MS = 250;
 const HIT_INTERVAL_MS = 20;
 const SHOT_TTL_MS = 10000;
 const MAX_SHOTS_PER_PLAYER = 128;
@@ -24,11 +25,6 @@ const CHAT_INTERVAL_MS = 500;
 
 // Central PvP combat tuning.
 const BALANCE = {
-    BASE_DAMAGE: 30,
-    MIN_DAMAGE: 1,
-
-    PROJECTILE_LIFETIME_SEC: 1.5,
-
     PENETRATION_FULL_DAMAGE_ANGLE_DEG: 5,
     PENETRATION_RICOCHET_ANGLE_DEG: 80,
     PENETRATION_MAX_CHANCE: 0.98,
@@ -58,43 +54,99 @@ const BALANCE = {
     BURN_TICK_DAMAGE_MAX: 7
 };
 
-// Allowed projectile profile limits.
-// Client values are validated before being stored on the server.
-const PROJECTILE_LIMITS = {
-    DAMAGE_MIN: 0,
-    DAMAGE_MAX: 100,
+// Server-authoritative module catalog.
+const MODULES_PATH = path.join(__dirname, 'modules.json');
 
-    MIN_DAMAGE_MIN: 0,
-    MIN_DAMAGE_MAX: 100,
+function loadModuleCatalog() {
+    let parsed;
 
-    SPEED_MIN: 1,
-    SPEED_MAX: 5000,
+    try {
+        parsed = JSON.parse(fs.readFileSync(MODULES_PATH, 'utf8'));
+    } catch (error) {
+        throw new Error(`Unable to load modules.json: ${error.message}`);
+    }
 
-    LIFETIME_MIN: 0.05,
-    LIFETIME_MAX: 10
-};
+    if (!parsed ||
+        typeof parsed !== 'object' ||
+        !parsed.hulls ||
+        !parsed.turrets ||
+        typeof parsed.hulls !== 'object' ||
+        typeof parsed.turrets !== 'object') {
+        throw new Error('modules.json has an invalid structure');
+    }
+
+    for (const [id, hull] of Object.entries(parsed.hulls)) {
+        if (!hull ||
+            !isFinitePositive(hull.max_hp)) {
+            throw new Error(`Invalid max_hp for hull "${id}" in modules.json`);
+        }
+    }
+
+    for (const [id, turret] of Object.entries(parsed.turrets)) {
+        const weapon = turret && turret.weapon;
+
+        if (!weapon ||
+            !isFiniteNonNegative(weapon.damage) ||
+            !isFiniteNonNegative(weapon.min_damage) ||
+            weapon.min_damage > weapon.damage ||
+            !isFinitePositive(weapon.speed) ||
+            !isFinitePositive(weapon.lifetime) ||
+            !isFinitePositive(weapon.fire_cooldown) ||
+            !Number.isInteger(weapon.projectiles_per_shot) ||
+            weapon.projectiles_per_shot < 1) {
+            throw new Error(`Invalid weapon profile for turret "${id}" in modules.json`);
+        }
+    }
+
+    if (!parsed.hulls.light_hull || !parsed.turrets.tank_turret) {
+        throw new Error('modules.json must define light_hull and tank_turret defaults');
+    }
+
+    return parsed;
+}
+
+function isFinitePositive(value) {
+    return typeof value === 'number' &&
+        Number.isFinite(value) &&
+        value > 0;
+}
+
+function isFiniteNonNegative(value) {
+    return typeof value === 'number' &&
+        Number.isFinite(value) &&
+        value >= 0;
+}
+
+const MODULES = loadModuleCatalog();
+const VALID_HULL_IDS = new Set(Object.keys(MODULES.hulls));
+const VALID_TURRET_IDS = new Set(Object.keys(MODULES.turrets));
+
+// Number of spawn slots must match the number of spawn-point objects
+// configured in the client map. No coordinates are stored on the server.
+const SPAWN_POINT_COUNT = Math.max(
+    1,
+    Math.min(1000, Number(process.env.SPAWN_POINT_COUNT) || 10)
+);
 
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
 
-const VALID_HULL_IDS = new Set([
-    'light_hull',
-    'weight_hull'
-]);
-
-const HULL_MAX_HP = {
-    light_hull: 100,
-    weight_hull: 225
-};
-
 function getHullMaxHp(hullId) {
-    return HULL_MAX_HP[hullId] || HULL_MAX_HP.light_hull;
+    const hull = MODULES.hulls[hullId] || MODULES.hulls.light_hull;
+    return hull.max_hp;
 }
 
-const VALID_TURRET_IDS = new Set([
-    'tank_turret',
-    'twin_barrel_turret'
-]);
+function getWeaponProfile(turretId) {
+    const turret = MODULES.turrets[turretId] || MODULES.turrets.tank_turret;
+    const weapon = turret.weapon;
+
+    return {
+        damage: weapon.damage,
+        min_damage: weapon.min_damage,
+        speed: weapon.speed,
+        lifetime: weapon.lifetime
+    };
+}
 
 const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -120,15 +172,6 @@ const shotKeys = new Map();
 let nextPlayerId = 1;
 let nextShotId = 1;
 let nextPingId = 1;
-
-const spawnPoints = [
-    { x: -400, y: -400 },
-    { x: 0, y: -400 },
-    { x: 400, y: -400 },
-    { x: -400, y: 400 },
-    { x: 0, y: 400 },
-    { x: 400, y: 400 }
-];
 
 // -----------------------------------------------------------------------------
 // General helpers
@@ -256,62 +299,14 @@ function broadcastToMatch(payload, exceptPlayerId = null) {
 // Projectile profile validation
 // -----------------------------------------------------------------------------
 
-function createProjectileProfile(message) {
-    const projectile = message.projectile;
-
-    // Backward compatibility with older clients.
-    if (projectile === undefined || projectile === null) {
-        return {
-            damage: BALANCE.BASE_DAMAGE,
-            min_damage: BALANCE.MIN_DAMAGE,
-            speed: 500,
-            lifetime: BALANCE.PROJECTILE_LIFETIME_SEC
-        };
-    }
-
-    if (typeof projectile !== 'object' ||
-        Array.isArray(projectile)) {
+function createProjectileProfile(player) {
+    if (!player || !VALID_TURRET_IDS.has(player.turret_id)) {
         return null;
     }
 
-    const {
-        damage,
-        min_damage,
-        speed,
-        lifetime
-    } = projectile;
-
-    if (!isNumber(damage) ||
-        damage < PROJECTILE_LIMITS.DAMAGE_MIN ||
-        damage > PROJECTILE_LIMITS.DAMAGE_MAX) {
-        return null;
-    }
-
-    if (!isNumber(min_damage) ||
-        min_damage < PROJECTILE_LIMITS.MIN_DAMAGE_MIN ||
-        min_damage > PROJECTILE_LIMITS.MIN_DAMAGE_MAX ||
-        min_damage > damage) {
-        return null;
-    }
-
-    if (!isNumber(speed) ||
-        speed < PROJECTILE_LIMITS.SPEED_MIN ||
-        speed > PROJECTILE_LIMITS.SPEED_MAX) {
-        return null;
-    }
-
-    if (!isNumber(lifetime) ||
-        lifetime < PROJECTILE_LIMITS.LIFETIME_MIN ||
-        lifetime > PROJECTILE_LIMITS.LIFETIME_MAX) {
-        return null;
-    }
-
-    return {
-        damage,
-        min_damage,
-        speed,
-        lifetime
-    };
+    // The client never supplies authoritative projectile statistics.
+    // Copy the profile so an already-fired projectile keeps its values.
+    return { ...getWeaponProfile(player.turret_id) };
 }
 
 // -----------------------------------------------------------------------------
@@ -409,11 +404,16 @@ function getAvailableSpawnIndex() {
         }
     }
 
-    for (let i = 0; i < spawnPoints.length; i++) {
-        if (!occupied.has(i)) return i;
+    const available = [];
+
+    for (let i = 0; i < SPAWN_POINT_COUNT; i++) {
+        if (!occupied.has(i)) available.push(i);
     }
 
-    return -1;
+    if (available.length === 0) return -1;
+
+    // Avoid always assigning the first point to the first player.
+    return available[Math.floor(Math.random() * available.length)];
 }
 
 function broadcastScoreboard() {
@@ -511,18 +511,26 @@ function enterBattle(ws, message = {}) {
         return;
     }
 
-    // Apply the selected garage loadout BEFORE initializing HP.
-    // The first state packet arrives after battle entry and must not decide
-    // whether a heavy hull starts with light-hull durability.
-    if (typeof message.hull_id === 'string' &&
-        VALID_HULL_IDS.has(message.hull_id)) {
-        player.hull_id = message.hull_id;
+    // Apply and validate the selected loadout BEFORE initializing HP.
+    // Missing IDs use explicit defaults; unknown IDs are rejected.
+    const hullId = message.hull_id === undefined
+        ? 'light_hull'
+        : message.hull_id;
+    const turretId = message.turret_id === undefined
+        ? 'tank_turret'
+        : message.turret_id;
+
+    if (typeof hullId !== 'string' || !VALID_HULL_IDS.has(hullId) ||
+        typeof turretId !== 'string' || !VALID_TURRET_IDS.has(turretId)) {
+        send(ws, {
+            type: 'enter_battle_rejected',
+            reason: 'invalid_loadout'
+        });
+        return;
     }
 
-    if (typeof message.turret_id === 'string' &&
-        VALID_TURRET_IDS.has(message.turret_id)) {
-        player.turret_id = message.turret_id;
-    }
+    player.hull_id = hullId;
+    player.turret_id = turretId;
 
     player.inBattle = true;
     player.spawn_index = spawnIndex;
@@ -658,7 +666,20 @@ function registerShot(ws, message) {
 
     const now = Date.now();
 
-    if (now - player.lastShotAt < SHOT_INTERVAL_MS) {
+    const weapon = MODULES.turrets[player.turret_id]?.weapon;
+
+    if (!weapon) {
+        send(ws, {
+            type: 'shot_rejected',
+            client_shot_id: message.shot_id || '',
+            reason: 'invalid_turret'
+        });
+        return;
+    }
+
+    const shotIntervalMs = weapon.fire_cooldown * 1000;
+
+    if (now - player.lastShotAt < shotIntervalMs) {
         send(ws, {
             type: 'shot_rejected',
             client_shot_id: message.shot_id || '',
@@ -693,7 +714,7 @@ function registerShot(ws, message) {
     }
 
     // Validate the projectile profile before registering the shot.
-    const projectileProfile = createProjectileProfile(message);
+    const projectileProfile = createProjectileProfile(player);
 
     if (!projectileProfile) {
         send(ws, {
@@ -1737,7 +1758,8 @@ const pingTimer = setInterval(() => {
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
     log(`Max match players: ${MAX_PLAYERS}`);
-    log(`Spawn points: ${spawnPoints.length}`);
+    log(`Spawn slots: ${SPAWN_POINT_COUNT}`);
+    log(`Loaded modules: ${VALID_HULL_IDS.size} hulls, ${VALID_TURRET_IDS.size} turrets`);
 });
 
 function shutdown() {

@@ -11,9 +11,9 @@
     "turrets": {
         "tank_turret": {
             "weapon": {
-                "damage": 30,
+                "damage": 40,
                 "min_damage": 1,
-                "speed": 500,
+                "speed": 750,
                 "lifetime": 1.5,
                 "fire_cooldown": 0.5,
                 "projectiles_per_shot": 1
@@ -21,9 +21,9 @@
         },
         "twin_barrel_turret": {
             "weapon": {
-                "damage": 30,
+                "damage": 15,
                 "min_damage": 1,
-                "speed": 500,
+                "speed": 750,
                 "lifetime": 1.5,
                 "fire_cooldown": 0.5,
                 "projectiles_per_shot": 1

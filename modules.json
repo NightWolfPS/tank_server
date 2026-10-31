@@ -1,0 +1,33 @@
+{
+    "version": 1,
+    "hulls": {
+        "light_hull": {
+            "max_hp": 100
+        },
+        "weight_hull": {
+            "max_hp": 225
+        }
+    },
+    "turrets": {
+        "tank_turret": {
+            "weapon": {
+                "damage": 30,
+                "min_damage": 1,
+                "speed": 500,
+                "lifetime": 1.5,
+                "fire_cooldown": 0.5,
+                "projectiles_per_shot": 1
+            }
+        },
+        "twin_barrel_turret": {
+            "weapon": {
+                "damage": 30,
+                "min_damage": 1,
+                "speed": 500,
+                "lifetime": 1.5,
+                "fire_cooldown": 0.5,
+                "projectiles_per_shot": 1
+            }
+        }
+    }
+}

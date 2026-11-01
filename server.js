@@ -186,6 +186,18 @@ function isNumber(value) {
         Number.isFinite(value);
 }
 
+function normalizeNickname(value) {
+    if (typeof value !== 'string') return null;
+
+    const nickname = value
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+        .trim();
+    const characters = [...nickname];
+
+    if (characters.length < 3 || characters.length > 16) return null;
+    return nickname;
+}
+
 function validCoordinate(value) {
     return isNumber(value) &&
         Math.abs(value) <= MAX_COORDINATE;
@@ -257,6 +269,7 @@ function resetPlayerPosition(player) {
 function publicPlayer(player) {
     return {
         id: player.id,
+        nickname: player.nickname || player.id,
         x: player.x,
         y: player.y,
         body_angle: player.body_angle,
@@ -369,6 +382,7 @@ function handleChatMessage(ws, message) {
     broadcastToMatch({
         type: 'chat_message',
         player_id: player.id,
+        nickname: player.nickname || player.id,
         text,
         timestamp: now
     });
@@ -425,6 +439,7 @@ function broadcastScoreboard() {
         )
         .map(player => ({
             id: player.id,
+            nickname: player.nickname || player.id,
             score: player.score,
             damage_dealt: player.damageDealt,
             ping: player.ping,
@@ -487,8 +502,18 @@ function enterBattle(ws, message = {}) {
         send(ws, {
             type: 'enter_battle_accepted',
             player_id: player.id,
+            nickname: player.nickname || player.id,
             spawn_index: player.spawn_index,
             players: getMatchPlayers(player.id).map(publicPlayer)
+        });
+        return;
+    }
+
+    const nickname = normalizeNickname(message.nickname);
+    if (!nickname) {
+        send(ws, {
+            type: 'enter_battle_rejected',
+            reason: 'invalid_nickname'
         });
         return;
     }
@@ -529,6 +554,7 @@ function enterBattle(ws, message = {}) {
         return;
     }
 
+    player.nickname = nickname;
     player.hull_id = hullId;
     player.turret_id = turretId;
 
@@ -550,6 +576,7 @@ function enterBattle(ws, message = {}) {
     send(ws, {
         type: 'enter_battle_accepted',
         player_id: player.id,
+        nickname: player.nickname,
         spawn_index: player.spawn_index,
         players: getMatchPlayers(player.id).map(publicPlayer)
     });
@@ -947,14 +974,18 @@ function broadcastKill(killerId, target, shotId, now) {
     broadcastToMatch({
         type: 'kill_feed',
         killer_id: killer ? killer.id : 'WORLD',
+        killer_nickname: killer ? (killer.nickname || killer.id) : 'WORLD',
         victim_id: target.id,
+        victim_nickname: target.nickname || target.id,
         shot_id: shotId || ''
     });
 
     broadcastToMatch({
         type: 'player_killed',
         killer_id: killer ? killer.id : 'WORLD',
+        killer_nickname: killer ? (killer.nickname || killer.id) : 'WORLD',
         victim_id: target.id,
+        victim_nickname: target.nickname || target.id,
         shot_id: shotId || ''
     });
 
@@ -1339,6 +1370,7 @@ function handleState(ws, message) {
     broadcastToMatch({
         type: 'state',
         player_id: player.id,
+        nickname: player.nickname || player.id,
         x: player.x,
         y: player.y,
         body_angle: player.body_angle,
@@ -1569,6 +1601,7 @@ function handleMessage(ws, message) {
                     )
                     .map(matchPlayer => ({
                         id: matchPlayer.id,
+                        nickname: matchPlayer.nickname || matchPlayer.id,
                         score: matchPlayer.score,
                         damage_dealt: matchPlayer.damageDealt,
                         ping: matchPlayer.ping,
@@ -1634,6 +1667,7 @@ wss.on('connection', (ws) => {
     const player = {
         id,
         ws,
+        nickname: null,
 
         inBattle: false,
 

@@ -4,14 +4,15 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const HOST = '0.0.0.0';
 const PORT = Number(process.env.PORT) || 8080;
 
-const MAX_PLAYERS = Math.max(
-    1,
-    Math.min(6, Number(process.env.MAX_PLAYERS) || 6)
-);
+const MATCH_DURATION_MS = 5 * 60 * 1000;
+const MIN_ROOM_PLAYERS = 2;
+const RECONNECT_GRACE_MS = 30 * 1000;
+const PING_TIMEOUT_MS = 5 * 1000;
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const STATE_INTERVAL_MS = 50;
@@ -123,10 +124,45 @@ const VALID_TURRET_IDS = new Set(Object.keys(MODULES.turrets));
 
 // Number of spawn slots must match the number of spawn-point objects
 // configured in the client map. No coordinates are stored on the server.
-const SPAWN_POINT_COUNT = Math.max(
-    1,
-    Math.min(1000, Number(process.env.SPAWN_POINT_COUNT) || 10)
-);
+const MAPS_PATH = path.join(__dirname, 'maps.json');
+
+function loadMapCatalog() {
+    let parsed;
+    try {
+        parsed = JSON.parse(fs.readFileSync(MAPS_PATH, 'utf8'));
+    } catch (error) {
+        throw new Error(`Unable to load maps.json: ${error.message}`);
+    }
+
+    if (!parsed || !parsed.maps || typeof parsed.maps !== 'object') {
+        throw new Error('maps.json must contain a maps object');
+    }
+
+    const entries = Object.entries(parsed.maps).filter(([id, map]) => {
+        if (!map || map.enabled === false) return false;
+        if (typeof map.scene !== 'string' || !map.scene.trim()) {
+            throw new Error(`Map "${id}" must define a scene socket`);
+        }
+        if (typeof map.collection !== 'string' || !map.collection.endsWith('.collectionc')) {
+            throw new Error(`Map "${id}" must define a compiled collection path`);
+        }
+        if (!Number.isInteger(map.max_players) || map.max_players < MIN_ROOM_PLAYERS) {
+            throw new Error(`Map "${id}" max_players must be an integer >= ${MIN_ROOM_PLAYERS}`);
+        }
+        if (!Number.isInteger(map.spawn_points) || map.spawn_points < map.max_players) {
+            throw new Error(`Map "${id}" spawn_points must be >= max_players`);
+        }
+        return true;
+    });
+
+    if (entries.length === 0) throw new Error('maps.json has no enabled maps');
+    return new Map(entries.map(([id, map]) => [id, {
+        id, scene: map.scene, collection: map.collection, maxPlayers: map.max_players,
+        spawnPoints: map.spawn_points
+    }]));
+}
+
+const MAPS = loadMapCatalog();
 
 const MAX_COORDINATE = 100000;
 const MAX_ANGLE = 1000000;
@@ -164,14 +200,16 @@ httpServer.listen(PORT, HOST, () => {
 
 // All connected WebSocket clients, including players in the menu.
 const players = new Map();
+const rooms = new Map();
 
-// Registered server-approved projectiles.
+// Registered server-approved projectiles. Keys include room identity.
 const shots = new Map();
 const shotKeys = new Map();
 
 let nextPlayerId = 1;
 let nextShotId = 1;
 let nextPingId = 1;
+let nextRoomId = 1;
 
 // -----------------------------------------------------------------------------
 // General helpers
@@ -237,11 +275,11 @@ function getPlayer(ws) {
 }
 
 function isMatchPlayer(player) {
-    return !!player && player.inBattle === true;
+    return !!player && player.inBattle === true && player.connected === true;
 }
 
 function isAlive(player) {
-    return !!player && player.lifeState === 'alive';
+    return !!player && player.lifeState === 'alive' && player.connected === true;
 }
 
 function hasPosition(player) {
@@ -288,24 +326,197 @@ function publicPlayer(player) {
         damage_dealt: player.damageDealt,
         ping: player.ping,
         kills: player.kills,
-        deaths: player.deaths
+        deaths: player.deaths,
+        connected: player.connected === true
     };
 }
 
-function broadcastToMatch(payload, exceptPlayerId = null) {
+function getRoom(roomId) {
+    return typeof roomId === 'string' ? rooms.get(roomId) || null : null;
+}
+
+function getPlayerRoom(player) {
+    return player && player.roomId ? getRoom(player.roomId) : null;
+}
+
+function inferRoomId(payload, exceptPlayerId) {
+    if (exceptPlayerId && players.has(exceptPlayerId)) {
+        return players.get(exceptPlayerId).roomId || null;
+    }
+    const ids = [payload && payload.player_id, payload && payload.target_player_id,
+        payload && payload.victim_id, payload && payload.killer_id];
+    for (const id of ids) {
+        const player = typeof id === 'string' ? players.get(id) : null;
+        if (player && player.roomId) return player.roomId;
+    }
+    return null;
+}
+
+function broadcastToMatch(payload, exceptPlayerId = null, roomId = null) {
+    roomId = roomId || inferRoomId(payload, exceptPlayerId);
+    const room = getRoom(roomId);
+    if (!room) return;
     const encoded = JSON.stringify(payload);
 
-    for (const player of players.values()) {
-        if (!player.inBattle) continue;
-        if (player.id === exceptPlayerId) continue;
+    for (const playerId of room.players) {
+        const player = players.get(playerId);
+        if (!player || player.id === exceptPlayerId || !player.connected) continue;
         if (!isOpen(player.ws)) continue;
+        try { player.ws.send(encoded); }
+        catch (error) { log('Match broadcast error:', error.message); }
+    }
+}
 
-        try {
-            player.ws.send(encoded);
-        } catch (error) {
-            log('Match broadcast error:', error.message);
+function getMatchPlayers(exceptPlayerId = null, roomId = null) {
+    roomId = roomId || (exceptPlayerId && players.get(exceptPlayerId)?.roomId);
+    const room = getRoom(roomId);
+    if (!room) return [];
+    return [...room.players]
+        .map(id => players.get(id))
+        .filter(player => player && player.inBattle && player.id !== exceptPlayerId);
+}
+
+function countMatchPlayers(roomId) {
+    const room = getRoom(roomId);
+    return room ? room.players.size : 0;
+}
+
+function getAvailableSpawnIndex(roomId) {
+    const room = getRoom(roomId);
+    if (!room) return -1;
+    const occupied = new Set();
+    for (const playerId of room.players) {
+        const player = players.get(playerId);
+        if (player && Number.isInteger(player.spawn_index)) occupied.add(player.spawn_index);
+    }
+    const available = [];
+    for (let i = 0; i < room.map.spawnPoints; i++) {
+        if (!occupied.has(i)) available.push(i);
+    }
+    return available.length ? available[Math.floor(Math.random() * available.length)] : -1;
+}
+
+function chooseRandomMap() {
+    const available = [...MAPS.values()];
+    return available[Math.floor(Math.random() * available.length)];
+}
+
+function createRoom() {
+    const map = chooseRandomMap();
+    const id = `ROOM_${String(nextRoomId++).padStart(4, '0')}`;
+    const room = {
+        id, map, status: 'waiting', players: new Set(),
+        createdAt: Date.now(), startedAt: null, endsAt: null,
+        shots: new Map(), shotKeys: new Map(), finishTimer: null
+    };
+    rooms.set(id, room);
+    log(`Created ${id} on map ${map.id} (${map.maxPlayers} slots)`);
+    return room;
+}
+
+function findRoomForPlayer() {
+    const running = [...rooms.values()]
+        .filter(room => room.status === 'running' && room.players.size < room.map.maxPlayers)
+        .sort((a, b) => a.createdAt - b.createdAt);
+    if (running.length) return running[0];
+
+    const waiting = [...rooms.values()]
+        .filter(room => room.status === 'waiting' && room.players.size < room.map.maxPlayers)
+        .sort((a, b) => a.createdAt - b.createdAt);
+    if (waiting.length) return waiting[0];
+
+    return createRoom();
+}
+
+function roomSnapshot(room) {
+    return {
+        room_id: room.id, map_id: room.map.id, scene: room.map.scene, collection: room.map.collection,
+        max_players: room.map.maxPlayers, players_count: room.players.size,
+        status: room.status, started_at: room.startedAt, ends_at: room.endsAt,
+        remaining_ms: room.status === 'running' ? Math.max(0, room.endsAt - Date.now()) : null
+    };
+}
+
+function countConnectedRoomPlayers(room) {
+    if (!room) return 0;
+    let count = 0;
+    for (const playerId of room.players) {
+        const player = players.get(playerId);
+        if (player && player.connected) count++;
+    }
+    return count;
+}
+
+function startRoom(room) {
+    if (!room || room.status !== 'waiting' || countConnectedRoomPlayers(room) < MIN_ROOM_PLAYERS) return;
+    const now = Date.now();
+    room.status = 'running';
+    room.startedAt = now;
+    room.endsAt = now + MATCH_DURATION_MS;
+    room.finishTimer = setTimeout(() => finishRoom(room.id), MATCH_DURATION_MS);
+    room.finishTimer.unref?.();
+    broadcastToMatch({ type: 'match_started', ...roomSnapshot(room) }, null, room.id);
+    for (const playerId of room.players) {
+        const player = players.get(playerId);
+        if (player) broadcastToMatch({ type: 'player_joined', player: publicPlayer(player) }, null, room.id);
+    }
+    log(`${room.id} started on ${room.map.id}: ${room.players.size}/${room.map.maxPlayers}`);
+}
+
+function removeShotsInRoom(roomId) {
+    for (const [shotId, shot] of shots) {
+        if (shot.roomId === roomId) {
+            shots.delete(shotId);
+            shotKeys.delete(shot.key);
         }
     }
+}
+
+function finishRoom(roomId) {
+    const room = getRoom(roomId);
+    if (!room || room.status !== 'running') return;
+    room.status = 'finished';
+    const results = getMatchPlayers(null, room.id)
+        .sort((a, b) => b.score - a.score || b.kills - a.kills || a.deaths - b.deaths)
+        .map(player => ({ id: player.id, nickname: player.nickname || player.id,
+            score: player.score, kills: player.kills, deaths: player.deaths,
+            damage_dealt: player.damageDealt }));
+    broadcastToMatch({ type: 'match_finished', ...roomSnapshot(room), results }, null, room.id);
+    log(`${room.id} finished`);
+    for (const playerId of [...room.players]) {
+        const player = players.get(playerId);
+        if (!player) continue;
+        player.inBattle = false;
+        player.roomId = null;
+        player.spawn_index = null;
+        player.lifeState = 'inactive';
+        player.burn = null;
+        player.score = 0;
+        player.damageDealt = 0;
+        player.kills = 0;
+        player.deaths = 0;
+        player.hp = getHullMaxHp(player.hull_id);
+        resetPlayerPosition(player);
+    }
+    removeShotsInRoom(roomId);
+    room.players.clear();
+    room.shots.clear();
+    room.shotKeys.clear();
+    setTimeout(() => rooms.delete(roomId), 5000).unref?.();
+}
+
+function broadcastScoreboard(roomId) {
+    const room = getRoom(roomId);
+    if (!room) return;
+    const list = getMatchPlayers(null, roomId)
+        .sort((a, b) => b.score - a.score || b.kills - a.kills || a.deaths - b.deaths)
+        .map(player => ({
+            id: player.id, nickname: player.nickname || player.id,
+            score: player.score, damage_dealt: player.damageDealt,
+            ping: player.ping, kills: player.kills, deaths: player.deaths,
+            life_state: player.lifeState, connected: player.connected === true
+        }));
+    broadcastToMatch({ type: 'scoreboard', players: list, ...roomSnapshot(room) }, null, roomId);
 }
 
 // -----------------------------------------------------------------------------
@@ -390,270 +601,184 @@ function handleChatMessage(ws, message) {
     log(`CHAT ${player.id}: ${text}`);
 }
 
-function getMatchPlayers(exceptPlayerId = null) {
-    return [...players.values()]
-        .filter(player =>
-            player.inBattle &&
-            player.id !== exceptPlayerId
-        );
-}
-
-function countMatchPlayers() {
-    let count = 0;
-
-    for (const player of players.values()) {
-        if (player.inBattle) count++;
-    }
-
-    return count;
-}
-
-function getAvailableSpawnIndex() {
-    const occupied = new Set();
-
-    for (const player of players.values()) {
-        if (player.inBattle &&
-            Number.isInteger(player.spawn_index)) {
-            occupied.add(player.spawn_index);
-        }
-    }
-
-    const available = [];
-
-    for (let i = 0; i < SPAWN_POINT_COUNT; i++) {
-        if (!occupied.has(i)) available.push(i);
-    }
-
-    if (available.length === 0) return -1;
-
-    // Avoid always assigning the first point to the first player.
-    return available[Math.floor(Math.random() * available.length)];
-}
-
-function broadcastScoreboard() {
-    const list = getMatchPlayers()
-        .sort((a, b) =>
-            b.score - a.score ||
-            b.kills - a.kills ||
-            a.deaths - b.deaths
-        )
-        .map(player => ({
-            id: player.id,
-            nickname: player.nickname || player.id,
-            score: player.score,
-            damage_dealt: player.damageDealt,
-            ping: player.ping,
-            kills: player.kills,
-            deaths: player.deaths,
-            life_state: player.lifeState
-        }));
-
-    broadcastToMatch({
-        type: 'scoreboard',
-        players: list
-    });
-}
-
-function sendWelcome(ws, player) {
-    send(ws, {
-        type: 'welcome',
-        player_id: player.id,
-        spawn_index: null,
-        in_battle: false,
-        players: []
-    });
-}
-
 // -----------------------------------------------------------------------------
 // Match lifecycle
 // -----------------------------------------------------------------------------
 
-function removeShotsOwnedBy(playerId) {
+function removeShotsOwnedBy(playerId, roomId = null) {
     for (const [shotId, shot] of shots) {
-        if (shot.ownerId === playerId) {
+        if (shot.ownerId === playerId && (!roomId || shot.roomId === roomId)) {
             shots.delete(shotId);
             shotKeys.delete(shot.key);
         }
     }
 }
 
-function clearBurnsOwnedBy(playerId) {
+function clearBurnsOwnedBy(playerId, roomId = null) {
     for (const target of players.values()) {
+        if (roomId && target.roomId !== roomId) continue;
         if (target.burn && target.burn.ownerId === playerId) {
             target.burn = null;
-
-            if (target.inBattle) {
-                send(target.ws, {
-                    type: 'status_effect_expired',
-                    target_player_id: target.id,
-                    effect: 'burn'
-                });
+            if (target.inBattle && target.connected) {
+                send(target.ws, { type: 'status_effect_expired',
+                    target_player_id: target.id, effect: 'burn' });
             }
         }
     }
 }
 
+function sendMatchAssignment(ws, player, room) {
+    send(ws, {
+        type: 'match_found',
+        ...roomSnapshot(room),
+        player_id: player.id,
+        nickname: player.nickname || player.id,
+        spawn_index: player.spawn_index
+    });
+}
+
+function sendBattleInitialization(ws, player, room) {
+    send(ws, {
+        type: 'enter_battle_accepted',
+        ...roomSnapshot(room),
+        player_id: player.id,
+        nickname: player.nickname || player.id,
+        spawn_index: player.spawn_index,
+        self_state: {
+            x: player.x, y: player.y,
+            body_angle: player.body_angle, turret_angle: player.turret_angle,
+            hp: player.hp, max_hp: getHullMaxHp(player.hull_id),
+            hull_id: player.hull_id, turret_id: player.turret_id,
+            life_state: player.lifeState,
+            burn: player.burn ? {
+                remaining_ms: Math.max(0, player.burn.endsAt - Date.now()),
+                tick_damage: player.burn.tickDamage,
+                owner_id: player.burn.ownerId
+            } : null
+        },
+        players: getMatchPlayers(player.id, room.id).map(publicPlayer)
+    });
+}
+
 function enterBattle(ws, message = {}) {
     const player = getPlayer(ws);
-
     if (!player) return;
 
-    if (player.inBattle) {
-        send(ws, {
-            type: 'enter_battle_accepted',
-            player_id: player.id,
-            nickname: player.nickname || player.id,
-            spawn_index: player.spawn_index,
-            players: getMatchPlayers(player.id).map(publicPlayer)
-        });
-        return;
+    if (player.inBattle && player.roomId) {
+        const existingRoom = getRoom(player.roomId);
+        if (existingRoom) {
+            sendMatchAssignment(ws, player, existingRoom);
+            return;
+        }
     }
 
     const nickname = normalizeNickname(message.nickname);
     if (!nickname) {
-        send(ws, {
-            type: 'enter_battle_rejected',
-            reason: 'invalid_nickname'
-        });
+        send(ws, { type: 'enter_battle_rejected', reason: 'invalid_nickname' });
         return;
     }
 
-    if (countMatchPlayers() >= MAX_PLAYERS) {
-        send(ws, {
-            type: 'enter_battle_rejected',
-            reason: 'match_full'
-        });
-        return;
-    }
-
-    const spawnIndex = getAvailableSpawnIndex();
-
-    if (spawnIndex < 0) {
-        send(ws, {
-            type: 'enter_battle_rejected',
-            reason: 'no_spawn_available'
-        });
-        return;
-    }
-
-    // Apply and validate the selected loadout BEFORE initializing HP.
-    // Missing IDs use explicit defaults; unknown IDs are rejected.
-    const hullId = message.hull_id === undefined
-        ? 'light_hull'
-        : message.hull_id;
-    const turretId = message.turret_id === undefined
-        ? 'tank_turret'
-        : message.turret_id;
-
+    const hullId = message.hull_id === undefined ? 'light_hull' : message.hull_id;
+    const turretId = message.turret_id === undefined ? 'tank_turret' : message.turret_id;
     if (typeof hullId !== 'string' || !VALID_HULL_IDS.has(hullId) ||
         typeof turretId !== 'string' || !VALID_TURRET_IDS.has(turretId)) {
-        send(ws, {
-            type: 'enter_battle_rejected',
-            reason: 'invalid_loadout'
-        });
+        send(ws, { type: 'enter_battle_rejected', reason: 'invalid_loadout' });
+        return;
+    }
+
+    const room = findRoomForPlayer();
+    const joiningRunningRoom = room.status === 'running';
+    const spawnIndex = getAvailableSpawnIndex(room.id);
+    if (spawnIndex < 0) {
+        send(ws, { type: 'enter_battle_rejected', reason: 'no_spawn_available' });
         return;
     }
 
     player.nickname = nickname;
     player.hull_id = hullId;
     player.turret_id = turretId;
-
     player.inBattle = true;
+    player.roomId = room.id;
     player.spawn_index = spawnIndex;
-
+    player.connected = true;
+    player.disconnectedAt = null;
     player.lifeState = 'alive';
     player.hp = getHullMaxHp(player.hull_id);
     player.burn = null;
-
     player.lastStateAt = 0;
     player.lastShotAt = 0;
     player.lastHitAt = 0;
     player.deathAt = null;
     player.inactiveAt = null;
-
     resetPlayerPosition(player);
+    room.players.add(player.id);
 
-    send(ws, {
-        type: 'enter_battle_accepted',
-        player_id: player.id,
-        nickname: player.nickname,
-        spawn_index: player.spawn_index,
-        players: getMatchPlayers(player.id).map(publicPlayer)
-    });
+    if (room.status === 'waiting' && room.players.size >= MIN_ROOM_PLAYERS) {
+        startRoom(room);
+    }
 
-    broadcastToMatch({
-        type: 'player_joined',
-        player: publicPlayer(player)
-    }, player.id);
+    sendMatchAssignment(ws, player, room);
+    if (joiningRunningRoom) {
+        broadcastToMatch({ type: 'player_joined', player: publicPlayer(player) }, null, room.id);
+    }
+    broadcastScoreboard(room.id);
 
-    broadcastScoreboard();
-
-    log(
-        'Player entered battle:',
-        player.id,
-        `spawn=${player.spawn_index}`,
-        `players=${countMatchPlayers()}/${MAX_PLAYERS}`
-    );
+    log(`Player ${player.id} assigned to ${room.id} (${room.map.id}), ` +
+        `${room.players.size}/${room.map.maxPlayers}, status=${room.status}`);
 }
 
 function leaveBattle(ws, reason = 'left_battle') {
     const player = getPlayer(ws);
-
     if (!player) return;
-
-    if (!player.inBattle) {
-        send(ws, {
-            type: 'leave_battle_accepted'
-        });
+    if (!player.inBattle || !player.roomId) {
+        send(ws, { type: 'leave_battle_accepted' });
         return;
     }
 
     const playerId = player.id;
+    const room = getRoom(player.roomId);
+    const roomId = player.roomId;
 
+    if (room) room.players.delete(playerId);
     player.inBattle = false;
+    player.roomId = null;
     player.lifeState = 'inactive';
     player.inactiveAt = null;
     player.deathAt = null;
     player.burn = null;
-
     player.score = 0;
     player.damageDealt = 0;
     player.kills = 0;
     player.deaths = 0;
-
+    player.spawn_index = null;
     resetPlayerPosition(player);
 
-    removeShotsOwnedBy(playerId);
-    clearBurnsOwnedBy(playerId);
+    removeShotsOwnedBy(playerId, roomId);
+    clearBurnsOwnedBy(playerId, roomId);
 
-    broadcastToMatch({
-        type: 'player_left',
-        player_id: playerId,
-        reason
-    });
+    if (room) {
+        if (room.status === 'running') {
+            broadcastToMatch({ type: 'player_left', player_id: playerId,
+                nickname: player.nickname || player.id, reason }, null, roomId);
+        }
+        broadcastScoreboard(roomId);
+        if (room.players.size === 0) {
+            if (room.finishTimer) clearTimeout(room.finishTimer);
+            removeShotsInRoom(roomId);
+            rooms.delete(roomId);
+            log(`${roomId} removed because it became empty`);
+        }
+    }
 
-    send(ws, {
-        type: 'leave_battle_accepted'
-    });
-
-    broadcastScoreboard();
-
-    log(
-        'Player left battle:',
-        playerId,
-        `players=${countMatchPlayers()}/${MAX_PLAYERS}`
-    );
+    send(ws, { type: 'leave_battle_accepted' });
+    log(`Player left battle: ${playerId}, room=${roomId}`);
 }
 
-// -----------------------------------------------------------------------------
-// Projectile registration and cleanup
-// -----------------------------------------------------------------------------
-
-function countPlayerShots(playerId) {
+function countPlayerShots(playerId, roomId) {
     let count = 0;
 
     for (const shot of shots.values()) {
-        if (shot.ownerId === playerId) count++;
+        if (shot.ownerId === playerId && shot.roomId === roomId) count++;
     }
 
     return count;
@@ -752,7 +877,7 @@ function registerShot(ws, message) {
         return;
     }
 
-    const key = `${player.id}:${clientShotId}`;
+    const key = `${player.roomId}:${player.id}:${clientShotId}`;
 
     if (shotKeys.has(key)) {
         send(ws, {
@@ -765,7 +890,7 @@ function registerShot(ws, message) {
 
     pruneShots();
 
-    if (countPlayerShots(player.id) >= MAX_SHOTS_PER_PLAYER) {
+    if (countPlayerShots(player.id, player.roomId) >= MAX_SHOTS_PER_PLAYER) {
         send(ws, {
             type: 'shot_rejected',
             client_shot_id: clientShotId,
@@ -783,6 +908,7 @@ function registerShot(ws, message) {
         key,
         clientShotId,
         ownerId: player.id,
+        roomId: player.roomId,
 
         x: message.x,
         y: message.y,
@@ -962,6 +1088,7 @@ function broadcastKill(killerId, target, shotId, now) {
 
     const killer = possibleKiller &&
         possibleKiller.inBattle &&
+        possibleKiller.connected &&
         possibleKiller.id !== target.id
         ? possibleKiller
         : null;
@@ -989,7 +1116,7 @@ function broadcastKill(killerId, target, shotId, now) {
         shot_id: shotId || ''
     });
 
-    broadcastScoreboard();
+    broadcastScoreboard(target.roomId);
 
     log(
         `${killer ? killer.id : 'WORLD'} killed ${target.id}` +
@@ -1002,9 +1129,8 @@ function broadcastKill(killerId, target, shotId, now) {
 function applyBurnTick(target, now) {
     const burn = target.burn;
 
-    if (!burn ||
-        !target.inBattle ||
-        target.lifeState !== 'alive') {
+    if (!target.connected) return;
+    if (!burn || !target.inBattle || target.lifeState !== 'alive') {
         target.burn = null;
         return;
     }
@@ -1042,6 +1168,7 @@ function applyBurnTick(target, now) {
 
     if (burnOwner &&
         burnOwner.inBattle &&
+        burnOwner.connected &&
         burnOwner.id !== target.id) {
         burnOwner.damageDealt += actualDamage;
     }
@@ -1060,7 +1187,7 @@ function applyBurnTick(target, now) {
         broadcastKill(burn.ownerId, target, burn.shotId, now);
         target.burn = null;
     } else {
-        broadcastScoreboard();
+        broadcastScoreboard(target.roomId);
     }
 }
 
@@ -1092,7 +1219,7 @@ function registerHit(ws, message) {
         return;
     }
 
-    const key = `${shooter.id}:${clientShotId}`;
+    const key = `${shooter.roomId}:${shooter.id}:${clientShotId}`;
     const serverShotId = shotKeys.get(key);
     const shot = serverShotId ? shots.get(serverShotId) : null;
 
@@ -1135,6 +1262,8 @@ function registerHit(ws, message) {
 
     if (!target ||
         !target.inBattle ||
+        !target.connected ||
+        target.roomId !== shooter.roomId ||
         target.id === shooter.id ||
         !isAlive(target)) {
         send(ws, {
@@ -1311,7 +1440,7 @@ function registerHit(ws, message) {
     if (target.hp <= 0 && target.lifeState === 'alive') {
         broadcastKill(shooter.id, target, shot.id, now);
     } else {
-        broadcastScoreboard();
+        broadcastScoreboard(shooter.roomId);
     }
 }
 
@@ -1404,7 +1533,7 @@ function setInactive(player, reason = 'inactive') {
         reason
     }, player.id);
 
-    broadcastScoreboard();
+    broadcastScoreboard(player.roomId);
 }
 
 function requestRespawn(ws) {
@@ -1457,7 +1586,7 @@ function requestRespawn(ws) {
         spawn_index: player.spawn_index
     });
 
-    broadcastScoreboard();
+    broadcastScoreboard(player.roomId);
 
     log(`${player.id} respawn accepted`);
 }
@@ -1477,17 +1606,13 @@ function handleMessage(ws, message) {
     switch (message.type) {
 
         case 'server_status': {
-            const playersInBattle = countMatchPlayers();
-
+            const activeRooms = [...rooms.values()].filter(room => room.status === 'running' || room.status === 'waiting');
+            const playersInBattle = activeRooms.reduce((sum, room) => sum + room.players.size, 0);
+            const totalCapacity = activeRooms.reduce((sum, room) => sum + room.map.maxPlayers, 0);
             send(ws, {
-                type: 'server_status',
-                connected_users: players.size,
-                players_in_battle: playersInBattle,
-                max_players: MAX_PLAYERS,
-                available_slots: Math.max(
-                    0,
-                    MAX_PLAYERS - playersInBattle
-                )
+                type: 'server_status', connected_users: [...players.values()].filter(p => p.connected).length,
+                players_in_battle: playersInBattle, rooms_count: activeRooms.length,
+                max_players: totalCapacity, available_slots: Math.max(0, totalCapacity - playersInBattle)
             });
             break;
         }
@@ -1518,10 +1643,11 @@ function handleMessage(ws, message) {
             }
 
             player.lastPingSampleAt = sentAt;
+            player.lastPongAt = now;
             player.ping = Math.max(0, now - sentAt);
 
-            if (player.inBattle) {
-                broadcastScoreboard();
+            if (player.inBattle && player.roomId) {
+                broadcastScoreboard(player.roomId);
             }
 
             break;
@@ -1535,16 +1661,22 @@ function handleMessage(ws, message) {
             leaveBattle(ws, 'left_battle');
             break;
 
+        case 'cancel_match': {
+            const player = getPlayer(ws);
+            const room = player && getPlayerRoom(player);
+            if (room && room.status === 'waiting') {
+                leaveBattle(ws, 'cancelled');
+            } else {
+                send(ws, { type: 'cancel_match_rejected', reason: 'match_already_running' });
+            }
+            break;
+        }
+
         case 'client_ready': {
             const player = getPlayer(ws);
-
-            if (!player) return;
-
-            send(ws, {
-                type: 'ready',
-                in_battle: player.inBattle
-            });
-
+            const room = player && getPlayerRoom(player);
+            if (!player || !room || !player.inBattle) return;
+            sendBattleInitialization(ws, player, room);
             break;
         }
 
@@ -1593,7 +1725,7 @@ function handleMessage(ws, message) {
 
             send(ws, {
                 type: 'scoreboard',
-                players: getMatchPlayers()
+                players: getMatchPlayers(null, player.roomId)
                     .sort((a, b) =>
                         b.score - a.score ||
                         b.kills - a.kills ||
@@ -1624,36 +1756,138 @@ function handleMessage(ws, message) {
 // Disconnect handling
 // -----------------------------------------------------------------------------
 
-function removePlayer(ws) {
-    const player = getPlayer(ws);
+function sendWelcome(ws, player, reconnected = false) {
+    const room = getPlayerRoom(player);
+    send(ws, {
+        type: 'welcome', player_id: player.id, identity_id: player.identityId, session_token: player.sessionToken,
+        spawn_index: player.spawn_index, in_battle: player.inBattle,
+        reconnected, room: room ? roomSnapshot(room) : null,
+        players: room ? getMatchPlayers(player.id, room.id).map(publicPlayer) : []
+    });
+}
 
-    if (!player) return;
+const identities = new Map();
 
-    const playerId = player.id;
-    const wasInBattle = player.inBattle;
+function createPlayer(ws, identityId) {
+    const playerNumber = nextPlayerId++;
+    const id = `P${playerNumber}`;
+    const player = {
+        id, identityId, sessionToken: crypto.randomBytes(32).toString('hex'),
+        ws, connected: true, disconnectedAt: null, reconnectTimer: null,
+        nickname: null, inBattle: false, roomId: null,
+        x: null, y: null, body_angle: 0, turret_angle: 0, state_seq: 0,
+        hull_id: 'light_hull', turret_id: 'tank_turret', spawn_index: null,
+        lifeState: 'inactive', hp: getHullMaxHp('light_hull'), burn: null,
+        score: 0, damageDealt: 0, ping: 0, lastPingSampleAt: 0,
+        lastPongAt: Date.now(), pingPending: new Map(),
+        kills: 0, deaths: 0, lastStateAt: 0, lastShotAt: 0, lastHitAt: 0,
+        lastChatAt: 0, deathAt: null, inactiveAt: null
+    };
+    players.set(id, player);
+    identities.set(identityId, player);
+    ws.playerId = id;
+    return player;
+}
 
-    player.inBattle = false;
-
-    players.delete(playerId);
-
-    removeShotsOwnedBy(playerId);
-    clearBurnsOwnedBy(playerId);
-
-    if (wasInBattle) {
-        broadcastToMatch({
-            type: 'player_left',
-            player_id: playerId,
-            reason: 'disconnected'
-        });
-
-        broadcastScoreboard();
+function authenticateConnection(ws, message) {
+    let identityId = typeof message.identity_id === 'string' ? message.identity_id : ''; 
+    const token = typeof message.session_token === 'string' ? message.session_token : '';
+    if (identityId === '' && token === '') {
+        identityId = crypto.randomBytes(16).toString('hex');
+    } else if (!/^[a-zA-Z0-9_-]{16,128}$/.test(identityId)) {
+        send(ws, { type: 'authentication_rejected', reason: 'invalid_identity' });
+        ws.close(1008, 'Invalid identity');
+        return;
     }
 
-    log(
-        'Player disconnected:',
-        playerId,
-        wasInBattle ? '(was in battle)' : '(was in menu)'
+    let player = identities.get(identityId);
+    if (player) {
+        if (player.connected) {
+            send(ws, { type: 'authentication_rejected', reason: 'duplicate_session' });
+            ws.close(1008, 'Session already active');
+            return;
+        }
+        if (token !== player.sessionToken || !player.disconnectedAt ||
+            Date.now() - player.disconnectedAt > RECONNECT_GRACE_MS) {
+            send(ws, { type: 'authentication_rejected', reason: 'reconnect_expired' });
+            ws.close(1008, 'Reconnect expired');
+            return;
+        }
+        if (player.reconnectTimer) clearTimeout(player.reconnectTimer);
+        player.reconnectTimer = null;
+        player.ws = ws;
+        player.connected = true;
+        player.lastPongAt = Date.now();
+        player.disconnectedAt = null;
+        player.pingPending.clear();
+        ws.playerId = player.id;
+        sendWelcome(ws, player, true);
+        if (player.roomId) {
+            const room = getPlayerRoom(player);
+            if (room && room.status === 'waiting') startRoom(room);
+            broadcastScoreboard(player.roomId);
+        }
+        log(`Player reconnected: ${player.id}`);
+        return;
+    }
+
+    player = createPlayer(ws, identityId);
+    sendWelcome(ws, player, false);
+    log(`Authenticated new player: ${player.id}`);
+}
+
+function expireDisconnectedPlayer(playerId, disconnectedAt) {
+    const player = players.get(playerId);
+    if (!player || player.connected || player.disconnectedAt !== disconnectedAt) return;
+
+    const room = getPlayerRoom(player);
+    const roomId = player.roomId;
+    if (room) {
+        room.players.delete(playerId);
+        if (room.status === 'running') {
+            broadcastToMatch({ type: 'player_left', player_id: playerId,
+                nickname: player.nickname || player.id, reason: 'left' }, null, roomId);
+        }
+        removeShotsOwnedBy(playerId, roomId);
+        clearBurnsOwnedBy(playerId, roomId);
+        broadcastScoreboard(roomId);
+        if (room.players.size === 0) {
+            if (room.finishTimer) clearTimeout(room.finishTimer);
+            removeShotsInRoom(roomId);
+            rooms.delete(roomId);
+            log(`${roomId} removed because it became empty`);
+        }
+    }
+
+    players.delete(playerId);
+    identities.delete(player.identityId);
+    log(`Reconnect window expired; ${playerId} permanently removed`);
+}
+
+function removePlayer(ws) {
+    const player = getPlayer(ws);
+    if (!player || player.ws !== ws) return;
+
+    player.ws = null;
+    player.connected = false;
+    player.pingPending.clear();
+
+    if (!player.inBattle || !player.roomId) {
+        players.delete(player.id);
+        identities.delete(player.identityId);
+        log(`Player disconnected from menu: ${player.id}`);
+        return;
+    }
+
+    const disconnectedAt = Date.now();
+    player.disconnectedAt = disconnectedAt;
+    player.reconnectTimer = setTimeout(
+        () => expireDisconnectedPlayer(player.id, disconnectedAt),
+        RECONNECT_GRACE_MS
     );
+    player.reconnectTimer.unref?.();
+    broadcastScoreboard(player.roomId);
+    log(`Player temporarily disconnected: ${player.id}; reconnect window ${RECONNECT_GRACE_MS}ms`);
 }
 
 // -----------------------------------------------------------------------------
@@ -1661,88 +1895,45 @@ function removePlayer(ws) {
 // -----------------------------------------------------------------------------
 
 wss.on('connection', (ws) => {
-    const playerNumber = nextPlayerId++;
-    const id = `P${playerNumber}`;
-
-    const player = {
-        id,
-        ws,
-        nickname: null,
-
-        inBattle: false,
-
-        x: null,
-        y: null,
-        body_angle: 0,
-        turret_angle: 0,
-        state_seq: 0,
-
-        hull_id: 'light_hull',
-        turret_id: 'tank_turret',
-
-        spawn_index: null,
-
-        lifeState: 'inactive',
-        hp: getHullMaxHp('light_hull'),
-        burn: null,
-
-        score: 0,
-        damageDealt: 0,
-        ping: 0,
-        lastPingSampleAt: 0,
-        pingPending: new Map(),
-
-        kills: 0,
-        deaths: 0,
-
-        lastStateAt: 0,
-        lastShotAt: 0,
-        lastHitAt: 0,
-        lastChatAt: 0,
-
-        deathAt: null,
-        inactiveAt: null
-    };
-
-    ws.playerId = id;
-    players.set(id, player);
-
-    sendWelcome(ws, player);
-
-    log('WebSocket connected:', id, '(not yet in battle)');
+    ws.playerId = null;
+    ws.authenticated = false;
+    log('WebSocket connection opened; waiting for identity authentication');
 
     ws.on('message', (raw, isBinary) => {
         if (isBinary) {
             sendError(ws, 'Binary messages are not supported');
             return;
         }
-
         let message;
+        try { message = JSON.parse(raw.toString()); }
+        catch { sendError(ws, 'Invalid JSON'); return; }
 
         try {
-            message = JSON.parse(raw.toString());
-        } catch {
-            sendError(ws, 'Invalid JSON');
-            return;
-        }
-
-        try {
+            if (!ws.authenticated) {
+                if (message && message.type === 'authenticate') {
+                    authenticateConnection(ws, message);
+                    if (ws.playerId) ws.authenticated = true;
+                } else if (message && message.type === 'server_status') {
+                    const activeRooms = [...rooms.values()].filter(room => room.status !== 'finished');
+                    const playersInBattle = activeRooms.reduce((sum, room) => sum + room.players.size, 0);
+                    const totalCapacity = activeRooms.reduce((sum, room) => sum + room.map.maxPlayers, 0);
+                    send(ws, { type: 'server_status', connected_users: [...players.values()].filter(p => p.connected).length,
+                        players_in_battle: playersInBattle, rooms_count: activeRooms.length,
+                        max_players: totalCapacity, available_slots: Math.max(0, totalCapacity - playersInBattle) });
+                } else {
+                    send(ws, { type: 'authentication_required' });
+                }
+                return;
+            }
             handleMessage(ws, message);
         } catch (error) {
-            log(
-                'Message handler error:',
-                error.stack || error.message
-            );
-
+            log('Message handler error:', error.stack || error.message);
             sendError(ws, 'Internal server error');
         }
     });
 
     ws.on('close', () => removePlayer(ws));
-
-    ws.on('error', (error) => {
-        log(`Socket error for ${id}:`, error.message);
-    });
+    ws.on('error', error => log('Socket error:', error.message));
 });
 
 // -----------------------------------------------------------------------------
@@ -1762,8 +1953,14 @@ const cleanupTimer = setInterval(() => {
 }, 100);
 
 const pingTimer = setInterval(() => {
+    const now = Date.now();
     for (const player of players.values()) {
-        if (!isOpen(player.ws)) continue;
+        if (!player.connected || !isOpen(player.ws)) continue;
+        if (now - player.lastPongAt > PING_TIMEOUT_MS) {
+            log(`Ping timeout for ${player.id}; closing stale connection`);
+            try { player.ws.terminate(); } catch (_) {}
+            continue;
+        }
 
         const pingId = nextPingId++;
 
@@ -1791,8 +1988,8 @@ const pingTimer = setInterval(() => {
 
 wss.on('listening', () => {
     log(`Listening on ${HOST}:${PORT}`);
-    log(`Max match players: ${MAX_PLAYERS}`);
-    log(`Spawn slots: ${SPAWN_POINT_COUNT}`);
+    log(`Enabled maps: ${MAPS.size}`);
+    log(`Match duration: ${MATCH_DURATION_MS / 1000}s; minimum room size: ${MIN_ROOM_PLAYERS}`);
     log(`Loaded modules: ${VALID_HULL_IDS.size} hulls, ${VALID_TURRET_IDS.size} turrets`);
 });
 

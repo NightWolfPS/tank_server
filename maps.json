@@ -1,0 +1,11 @@
+{
+  "maps": {
+    "main": {
+      "scene": "main",
+      "collection": "/main.collectionc",
+      "max_players": 10,
+      "spawn_points": 10,
+      "enabled": true
+    }
+  }
+}

@@ -20,6 +20,7 @@ const HIT_INTERVAL_MS = 20;
 const SHOT_TTL_MS = 10000;
 const MAX_SHOTS_PER_PLAYER = 128;
 const RESPAWN_DELAY_MS = 1500;
+const MATCH_ENDING_DELAY_MS = 3000;
 const MAX_DAMAGE = 100;
 const CHAT_MAX_LENGTH = 120;
 const CHAT_INTERVAL_MS = 500;
@@ -275,7 +276,9 @@ function getPlayer(ws) {
 }
 
 function isMatchPlayer(player) {
-    return !!player && player.inBattle === true && player.connected === true;
+    if (!player || player.inBattle !== true || player.connected !== true) return false;
+    const room = getPlayerRoom(player);
+    return !!room && room.status === 'running';
 }
 
 function isAlive(player) {
@@ -355,16 +358,22 @@ function inferRoomId(payload, exceptPlayerId) {
 function broadcastToMatch(payload, exceptPlayerId = null, roomId = null) {
     roomId = roomId || inferRoomId(payload, exceptPlayerId);
     const room = getRoom(roomId);
-    if (!room) return;
+    if (!room) return 0;
     const encoded = JSON.stringify(payload);
+    let sent = 0;
 
     for (const playerId of room.players) {
         const player = players.get(playerId);
         if (!player || player.id === exceptPlayerId || !player.connected) continue;
         if (!isOpen(player.ws)) continue;
-        try { player.ws.send(encoded); }
-        catch (error) { log('Match broadcast error:', error.message); }
+        try {
+            player.ws.send(encoded);
+            sent++;
+        } catch (error) {
+            log('Match broadcast error:', error.message);
+        }
     }
+    return sent;
 }
 
 function getMatchPlayers(exceptPlayerId = null, roomId = null) {
@@ -407,7 +416,7 @@ function createRoom() {
     const room = {
         id, map, status: 'waiting', players: new Set(),
         createdAt: Date.now(), startedAt: null, endsAt: null,
-        shots: new Map(), shotKeys: new Map(), finishTimer: null
+        shots: new Map(), shotKeys: new Map(), finishTimer: null, endingTimer: null
     };
     rooms.set(id, room);
     log(`Created ${id} on map ${map.id} (${map.maxPlayers} slots)`);
@@ -453,7 +462,7 @@ function startRoom(room) {
     room.status = 'running';
     room.startedAt = now;
     room.endsAt = now + MATCH_DURATION_MS;
-    room.finishTimer = setTimeout(() => finishRoom(room.id), MATCH_DURATION_MS);
+    room.finishTimer = setTimeout(() => beginMatchEnding(room.id), MATCH_DURATION_MS);
     room.finishTimer.unref?.();
     broadcastToMatch({ type: 'match_started', ...roomSnapshot(room) }, null, room.id);
     for (const playerId of room.players) {
@@ -472,17 +481,65 @@ function removeShotsInRoom(roomId) {
     }
 }
 
-function finishRoom(roomId) {
+function beginMatchEnding(roomId) {
     const room = getRoom(roomId);
     if (!room || room.status !== 'running') return;
+
+    room.status = 'ending';
+    room.endingStartedAt = Date.now();
+
+    // Freeze gameplay authoritatively before clients display the end banner.
+    for (const playerId of room.players) {
+        const player = players.get(playerId);
+        if (player) {
+            player.burn = null;
+            player.lifeState = player.lifeState === 'alive' ? 'inactive' : player.lifeState;
+        }
+    }
+    removeShotsInRoom(roomId);
+    room.shots.clear();
+    room.shotKeys.clear();
+
+    broadcastToMatch({
+        type: 'match_ending',
+        ...roomSnapshot(room),
+        duration_ms: MATCH_ENDING_DELAY_MS
+    }, null, room.id);
+
+    room.endingTimer = setTimeout(() => finishRoom(roomId), MATCH_ENDING_DELAY_MS);
+    room.endingTimer.unref?.();
+    log(`${room.id} entering ${MATCH_ENDING_DELAY_MS}ms ending phase`);
+}
+
+function finishRoom(roomId) {
+    const room = getRoom(roomId);
+    if (!room || room.status !== 'ending') return;
     room.status = 'finished';
-    const results = getMatchPlayers(null, room.id)
-        .sort((a, b) => b.score - a.score || b.kills - a.kills || a.deaths - b.deaths)
-        .map(player => ({ id: player.id, nickname: player.nickname || player.id,
-            score: player.score, kills: player.kills, deaths: player.deaths,
-            damage_dealt: player.damageDealt }));
-    broadcastToMatch({ type: 'match_finished', ...roomSnapshot(room), results }, null, room.id);
-    log(`${room.id} finished`);
+    // Use room membership as the source of truth here. During the ending phase
+    // players are frozen, and their inBattle flag must not decide whether their
+    // final score is included in the results.
+    const results = [...room.players]
+        .map(playerId => players.get(playerId))
+        .filter(player => player)
+        .sort((a, b) => (b.score || 0) - (a.score || 0)
+            || (b.kills || 0) - (a.kills || 0)
+            || (a.deaths || 0) - (b.deaths || 0))
+        .map(player => ({
+            id: player.id,
+            nickname: player.nickname || player.id,
+            score: Number(player.score) || 0,
+            kills: Number(player.kills) || 0,
+            deaths: Number(player.deaths) || 0,
+            damage_dealt: Number(player.damageDealt) || 0
+        }));
+
+    const delivered = broadcastToMatch({
+        type: 'match_finished',
+        ...roomSnapshot(room),
+        results
+    }, null, room.id);
+
+    log(`${room.id} finished; results=${results.length}; delivered=${delivered}`);
     for (const playerId of [...room.players]) {
         const player = players.get(playerId);
         if (!player) continue;
@@ -764,6 +821,7 @@ function leaveBattle(ws, reason = 'left_battle') {
         broadcastScoreboard(roomId);
         if (room.players.size === 0) {
             if (room.finishTimer) clearTimeout(room.finishTimer);
+            if (room.endingTimer) clearTimeout(room.endingTimer);
             removeShotsInRoom(roomId);
             rooms.delete(roomId);
             log(`${roomId} removed because it became empty`);
@@ -1853,6 +1911,7 @@ function expireDisconnectedPlayer(playerId, disconnectedAt) {
         broadcastScoreboard(roomId);
         if (room.players.size === 0) {
             if (room.finishTimer) clearTimeout(room.finishTimer);
+            if (room.endingTimer) clearTimeout(room.endingTimer);
             removeShotsInRoom(roomId);
             rooms.delete(roomId);
             log(`${roomId} removed because it became empty`);

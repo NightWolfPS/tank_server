@@ -6,6 +6,9 @@
         },
         "weight_hull": {
             "max_hp": 225
+        },
+        "middle_hull": {
+            "max_hp": 175
         }
     },
     "turrets": {
@@ -26,6 +29,16 @@
                 "speed": 750,
                 "lifetime": 1.5,
                 "fire_cooldown": 0.5,
+                "projectiles_per_shot": 1
+            }
+        },
+        "heavy_turret": {
+            "weapon": {
+                "damage": 65,
+                "min_damage": 1,
+                "speed": 750,
+                "lifetime": 1.5,
+                "fire_cooldown": 6,
                 "projectiles_per_shot": 1
             }
         }

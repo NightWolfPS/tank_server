@@ -6,6 +6,13 @@
       "max_players": 10,
       "spawn_points": 10,
       "enabled": true
+    },
+    "snowy_castle": {
+      "scene": "snowy_castle",
+      "collection": "/main/snowy_castle.collectionc",
+      "max_players": 6,
+      "spawn_points": 6,
+      "enabled": true
     }
   }
 }

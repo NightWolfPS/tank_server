@@ -158,7 +158,8 @@ function loadMapCatalog() {
 
     if (entries.length === 0) throw new Error('maps.json has no enabled maps');
     return new Map(entries.map(([id, map]) => [id, {
-        id, scene: map.scene, collection: map.collection, maxPlayers: map.max_players,
+        id, name: (typeof map.name === 'string' && map.name.trim()) ? map.name.trim() : id,
+        scene: map.scene, collection: map.collection, maxPlayers: map.max_players,
         spawnPoints: map.spawn_points
     }]));
 }
@@ -439,7 +440,8 @@ function findRoomForPlayer() {
 
 function roomSnapshot(room) {
     return {
-        room_id: room.id, map_id: room.map.id, scene: room.map.scene, collection: room.map.collection,
+        room_id: room.id, map_id: room.map.id, map_name: room.map.name,
+        scene: room.map.scene, collection: room.map.collection,
         max_players: room.map.maxPlayers, players_count: room.players.size,
         status: room.status, started_at: room.startedAt, ends_at: room.endsAt,
         remaining_ms: room.status === 'running' ? Math.max(0, room.endsAt - Date.now()) : null

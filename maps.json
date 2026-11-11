@@ -15,6 +15,14 @@
       "spawn_points": 6,
       "enabled": true,
       "name": "Снежная крепость DM"
+    },
+    "desert_city": {
+      "scene": "desert_city",
+      "collection": "/main/desert_map_dm.collectionc",
+      "max_players": 6,
+      "spawn_points": 6,
+      "enabled": true,
+      "name": "Город в пустыне DM"
     }
   }
 }

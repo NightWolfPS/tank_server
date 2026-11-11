@@ -442,7 +442,9 @@ function roomSnapshot(room) {
     return {
         room_id: room.id, map_id: room.map.id, map_name: room.map.name,
         scene: room.map.scene, collection: room.map.collection,
-        max_players: room.map.maxPlayers, players_count: room.players.size,
+        max_players: room.map.maxPlayers,
+        players_count: room.players.size,
+        queue_count: room.players.size,
         status: room.status, started_at: room.startedAt, ends_at: room.endsAt,
         remaining_ms: room.status === 'running' ? Math.max(0, room.endsAt - Date.now()) : null
     };
@@ -523,9 +525,9 @@ function finishRoom(roomId) {
     const results = [...room.players]
         .map(playerId => players.get(playerId))
         .filter(player => player)
-        .sort((a, b) => (Number(b.damageDealt) || 0) - (Number(a.damageDealt) || 0)
-    || (Number(b.kills) || 0) - (Number(a.kills) || 0)
-    || (Number(a.deaths) || 0) - (Number(b.deaths) || 0))
+        .sort((a, b) => (b.score || 0) - (a.score || 0)
+            || (b.kills || 0) - (a.kills || 0)
+            || (a.deaths || 0) - (b.deaths || 0))
         .map(player => ({
             id: player.id,
             nickname: player.nickname || player.id,
@@ -568,9 +570,7 @@ function broadcastScoreboard(roomId) {
     const room = getRoom(roomId);
     if (!room) return;
     const list = getMatchPlayers(null, roomId)
-        .sort((a, b) => (Number(b.damageDealt) || 0) - (Number(a.damageDealt) || 0)
-    || (Number(b.kills) || 0) - (Number(a.kills) || 0)
-    || (Number(a.deaths) || 0) - (Number(b.deaths) || 0))
+        .sort((a, b) => b.score - a.score || b.kills - a.kills || a.deaths - b.deaths)
         .map(player => ({
             id: player.id, nickname: player.nickname || player.id,
             score: player.score, damage_dealt: player.damageDealt,

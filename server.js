@@ -10,8 +10,8 @@ const HOST = '0.0.0.0';
 const PORT = Number(process.env.PORT) || 8080;
 
 const MATCH_DURATION_MS = 10 * 60 * 1000;
-const MIN_ROOM_PLAYERS = 2;
-const RECONNECT_GRACE_MS = 30 * 1000;
+const MIN_ROOM_PLAYERS = 4;
+const RECONNECT_GRACE_MS = 60 * 1000;
 const PING_TIMEOUT_MS = 5 * 1000;
 
 const MAX_MESSAGE_BYTES = 16 * 1024;

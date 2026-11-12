@@ -1478,8 +1478,11 @@ function registerHit(ws, message) {
 
     target.hp = Math.max(0, target.hp - actualDamage);
 
+    // Award a point only when the projectile actually deals damage.
+if (actualDamage > 0) {
     shooter.score += 1;
     shooter.damageDealt += actualDamage;
+}
 
     broadcastToMatch({
         type: 'projectile_hit',

@@ -28,7 +28,7 @@
                 "min_damage": 1,
                 "speed": 750,
                 "lifetime": 1.5,
-                "fire_cooldown": 0.5,
+                "fire_cooldown": 0.8,
                 "projectiles_per_shot": 1
             }
         },
